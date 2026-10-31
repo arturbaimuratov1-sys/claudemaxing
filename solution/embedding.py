@@ -39,6 +39,7 @@ def _to_fp16_via_host(weight, rows=8192):
         if not torch.equal(low.float(), chunk):
             return None
         host[r0:r0 + rows].copy_(low)
+    del chunk, low  # views of the fp32 storage: drop them, or it is not freed below
     device = weight.device
     weight.data = torch.empty(0, dtype=torch.float16, device=device)  # frees the fp32 storage
     weight.data = host.to(device)

@@ -92,3 +92,20 @@ activations per token and layer from `saved_tensors_hooks` with 4 x 512 tokens:
 Activations kept per token and layer (572c891): SDPA in fp32 (q/k/v come out of the 4-bit
 projections in fp32, k/v expanded to 12 heads) 43.0 KB; RMSNorm inputs (fp32) 12.3 KB; LoRA A
 inputs (fp16) 6.3 KB; MLP input (fp32) 6.1 KB; dropout masks 2.3 KB.
+
+### Run 1 of 5 (Kaggle T4, `--repeats 1 --profile`): 0727b36, own attention + fp16 MLP input
+
+| commit | soup train, s (base same run) | peak MiB (nvidia-smi) | torch alloc / reserved | eval loss vs base | own kernels (w/o SwiGLU) | checks |
+|---|---|---|---|---|---|---|
+| 0727b36 | 160.4 (87.2) | 3933 | 3507 / 3550 | -0.002% | 70.5% (68.8%) | 9/10 (check 8: time x1.840) |
+
+- Rejected: `qwen_attn_fwd_kernel` 22 ms per call on the T4 (0.13 ms on the RTX 4060). A
+  micro-benchmark in the same Kaggle session (bench_attn.py) shows why: Triton 3.6 on sm75 emits
+  no `mma.sync` for `tl.dot` (FMA only, 1798 register spills at 64x64 tiles); fwd+bwd 40 ms
+  against 2.6 ms for torch's fp16 SDPA (8.7 ms fp32). The kernel stays in solution/attention.py
+  but `apply()` no longer uses it (45464f8).
+- Memory: -330 MiB vs 572c891, much less than the local estimate. Under fp16 autocast the base
+  SDPA keeps fp16 (expanded) q/k/v on the T4 (~10 KB/token/layer, bench_sdpa.py), not the fp32
+  tensors seen on the RTX 4060 without a mask; the attention saving was mostly illusory.
+- `is_causal + enable_gqa` (no k/v expansion) is no alternative: torch falls back to a path that
+  keeps 35 KB/token and is slower (bench_sdpa.py).

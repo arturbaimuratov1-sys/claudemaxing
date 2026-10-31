@@ -71,3 +71,17 @@ def test_untied_or_trainable_left_alone():
         model = tiny()
         model.get_input_embeddings().weight.requires_grad_(True)
         assert shrink_tied_embedding(model) is False
+
+
+def test_conversion_never_holds_both_copies():
+    model = tiny()
+    w = model.get_input_embeddings().weight
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    with torch.autocast("cuda", dtype=torch.float16):
+        assert shrink_tied_embedding(model) is True
+    fp32_bytes = w.numel() * 4
+    # peak: the fp32 weight plus one checked chunk at most, never fp32 + full fp16
+    assert torch.cuda.max_memory_allocated() - before < fp32_bytes * 0.5 + 8192 * 64 * 8
+    assert torch.cuda.memory_allocated() - before <= -fp32_bytes // 2 + 4096
