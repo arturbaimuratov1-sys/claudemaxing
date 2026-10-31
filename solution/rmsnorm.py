@@ -4,7 +4,8 @@ transformers' Qwen2RMSNorm.forward is a chain of small torch ops (cast to fp32, 
 rsqrt, multiply, cast back, multiply by the weight) that writes several fp32 temporaries and
 keeps them for backward. Here one program handles one row: forward reads x once and writes
 the output and one fp32 `rstd` per row; backward recomputes the normalised value from x and
-`rstd`, so nothing else is stored.
+`rstd` (or, for the 4-bit model's frozen fp32 norms, from the fp16 copy of the output that the
+next layers use anyway; see RMSNorm.forward).
 
 The output reproduces the reference exactly in dtype and in rounding: the normalised value
 is rounded to the input dtype first, and only then multiplied by the weight, so the result
@@ -94,12 +95,21 @@ _LAST_LOW = [None, -1, None]  # (weakref to the last output, its version, weakre
 _NO_ZEROS = {}
 
 
+# y16 / w keeps 2^-11 relative accuracy while |y| is a normal fp16 number; tiny |w| would
+# amplify the absolute error floor of fp16 subnormals (2^-25 / |w|), so such weights keep the
+# exact path.
+MIN_ABS_WEIGHT = 2.0 ** -10
+
+
 def _no_zeros(weight):
-    """True if the frozen weight has no zero (checked once per weight version)."""
+    """True if every |w| of the frozen weight is at least MIN_ABS_WEIGHT (checked once per
+    weight version and storage)."""
     key = id(weight)
     entry = _NO_ZEROS.get(key)
-    if entry is None or entry[0]() is not weight or entry[1] != weight._version:
-        entry = (weakref.ref(weight), weight._version, not bool((weight == 0).any()))
+    if (entry is None or entry[0]() is not weight or entry[1] != weight._version
+            or entry[3] != weight.data_ptr()):
+        entry = (weakref.ref(weight), weight._version,
+                 bool(weight.abs().min() >= MIN_ABS_WEIGHT), weight.data_ptr())
         _NO_ZEROS[key] = entry
     return entry[2]
 
@@ -127,11 +137,12 @@ class RMSNorm(torch.autograd.Function):
         rstd = torch.empty(n_rows, dtype=torch.float32, device=x.device)
         # Activation compression: with an fp32 x and a frozen weight, backward needs x only
         # for the normalised value x * rstd inside dx. The kernel writes the fp16 copy of the
-        # output, (x * rstd) * w, and backward divides it by w (a weight without zeros):
-        # 2^-11 relative per element, dx changes by ~1e-5 relative. That fp16 copy is exactly
+        # output, (x * rstd) * w, and backward divides it by w (all |w| >= 2^-10): 2^-11
+        # relative per element while the output is a normal fp16 number, dx changes by ~1e-5
+        # relative. That fp16 copy is exactly
         # what the next layers cast the output to (q/k/v and the MLP compute in fp16), so they
         # take it from here (fp16_copy_of) and keep the same tensor: one copy for all of them.
-        # A trainable weight, or one with zeros, keeps the exact fp32 x.
+        # A trainable weight, or one with tiny or zero entries, keeps the exact fp32 x.
         low = (torch.empty((n_rows, n_cols), dtype=torch.float16, device=x.device)
                if x.dtype == torch.float32 and weight.dtype == torch.float32
                and not weight.requires_grad and ctx.needs_input_grad[0]

@@ -196,7 +196,7 @@ def test_patch_is_idempotent():
 
 def test_frozen_weight_fp32_input_keeps_fp16_copy():
     """Activation compression: fp32 x with a frozen fp32 weight (the 4-bit model's norms) keeps the
-    fp16 normalised value for backward. Output equal to torch's to fp32 rounding; dx within fp16
+    fp16 copy of its output for backward. Output equal to torch's to fp32 rounding; dx within fp16
     rounding of torch's, also with residual values far outside the fp16 range."""
     from solution.rmsnorm import rmsnorm
 
@@ -222,3 +222,35 @@ def test_frozen_weight_fp32_input_keeps_fp16_copy():
     assert dx.dtype == torch.float32
     rel = ((dx - x.grad).norm() / x.grad.norm()).item()
     assert rel < 1e-3, rel
+
+
+def test_fp16_copy_of_contract():
+    """fp16_copy_of: bit-identical to .to(fp16) for the last output only; None for anything else
+    (a view, detach, an older output, after an in-place change, no grad, small weights)."""
+    from solution.rmsnorm import fp16_copy_of, rmsnorm
+
+    torch.manual_seed(0)
+    x = (torch.randn(3, 20, 256, device="cuda") * 4).requires_grad_(True)
+    w = torch.rand(256, device="cuda") * 3 + 0.01
+    y1 = rmsnorm(x, w, 1e-6)
+    c1 = fp16_copy_of(y1)
+    assert c1 is not None and torch.equal(c1.view(torch.int16), y1.to(torch.float16).view(torch.int16))
+    assert fp16_copy_of(y1.detach()) is None and fp16_copy_of(y1[0]) is None
+    y2 = rmsnorm(x * 2, w, 1e-6)
+    assert fp16_copy_of(y1) is None and fp16_copy_of(y2) is not None
+    y3 = rmsnorm(x, w, 1e-6).clone()
+    y4 = rmsnorm(x, w, 1e-6)
+    with torch.no_grad():
+        y4.view(-1)[0] += 1  # in place through a view
+    assert fp16_copy_of(y4) is None and fp16_copy_of(y3) is None
+    with torch.no_grad():
+        assert fp16_copy_of(rmsnorm(x, w, 1e-6)) is None
+    small = w.clone()
+    small[5] = 1e-5
+    assert fp16_copy_of(rmsnorm(x, small, 1e-6)) is None  # tiny |w|: exact path, no copy
+    zero = w.clone()
+    zero[3] = 0.0
+    out = rmsnorm(x, zero, 1e-6)
+    assert fp16_copy_of(out) is None
+    out.sum().backward()
+    assert torch.isfinite(x.grad).all()

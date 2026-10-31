@@ -124,3 +124,25 @@ inputs (fp16) 6.3 KB; MLP input (fp32) 6.1 KB; dropout masks 2.3 KB.
   and layer: SDPA 13.0 KB (fp16, expanded k/v), LoRA A inputs 6.3 KB, RMSNorm 6.1 KB, MLP 3.1 KB,
   dropout masks 3.0 KB; load-time peak 1990 MiB allocated while prepare_model_for_kbit_training
   upcasts the embedding (a floor for the whole run).
+
+### Run 3 of 5: 8f6a67f (+ own NF4 dequant kernel, LoRA branch with bit-packed dropout mask, grouped SDPA)
+
+| commit | soup train, s (base same run) | peak MiB (nvidia-smi) | torch alloc / reserved | eval loss vs base | own kernels (w/o SwiGLU) | checks |
+|---|---|---|---|---|---|---|
+| 8f6a67f | 76.8 (78.4), s = 1.022 | **3157** | 2776 / 3014 | +0.001% | **14.7% (11.3%)** | 10/10 |
+
+- check 6: first step 0.02%, mean 0.01%; check 8: time x0.979, memory x0.220.
+- train loop 52.79 s, timed loop 44.29 s (run 2: 51.97 / 45.27), median step 0.725 s (run 2:
+  0.753, base 0.861): the steady state is 14.5% faster than the base, but the first two steps
+  take 8.5 s against 2.4 s for the base (Triton JIT of our ~12 kernel variants on Kaggle's CPU;
+  the harness gives every run a fresh TRITON_CACHE_DIR, so this is a fair cost). Wall time is
+  therefore only 2% better than the base; vs 572c891 (x0.972 of its base) it is 0.7% worse,
+  within the 3% allowed.
+- own kernel ms (timed loop 44.29 s): nf4_dequant 2666, silu_mul_bwd_recompute 964,
+  lm_head_vocab_chunk 584, silu_mul_fwd_persistent 564, qwen_rmsnorm_fwd 382, qwen_rope 374,
+  lora_dropout_unpack 366, qwen_rmsnorm_bwd 353, lora_dropout_pack 265.
+- In the same session (bench_sdpa.py, bench_nf4.py on the T4): grouped SDPA 3.2 ms vs 12.2 ms per
+  layer fwd+bwd; our NF4 dequant 200 us vs 303 us (8960x1536).
+- tests_local on Kaggle: 2 LoRA tests failed with an ImportError from peft's torchao dispatch
+  (their toy model was not marked 4-bit, so peft looked further than bitsandbytes); fixed in the
+  tests (856ac36), the run itself uses peft's bitsandbytes LoRA layer.
