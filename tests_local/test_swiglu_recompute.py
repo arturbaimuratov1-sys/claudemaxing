@@ -222,6 +222,111 @@ def test_patched_qwen2_mlp_matches_the_original():
         cls.forward = saved
 
 
+@pytest.mark.parametrize("autocast", [False, True])
+def test_frozen_mlp_recomputes_gate_and_up(autocast):
+    """With frozen projections (the 4-bit model) only the MLP input is kept for backward;
+    output and input gradient match the original forward under the same autocast state."""
+    modeling = pytest.importorskip("transformers.models.qwen2.modeling_qwen2")
+    from solution import swiglu_recompute as mod
+
+    cls = modeling.Qwen2MLP
+    saved = cls.forward
+    ctx = (lambda: torch.autocast("cuda", dtype=F16)) if autocast else \
+        (lambda: torch.autocast("cuda", enabled=False))
+    try:
+        mlp = _small_mlp(modeling)
+        if autocast:
+            mlp = mlp.float()
+        mlp.requires_grad_(False)
+        x_dtype = F32 if autocast else F16
+        x = (torch.randn(4, 96, 256, device="cuda") * 2).to(x_dtype)
+        grad = torch.randn(4, 96, 256, device="cuda")
+
+        x_ref = x.clone().requires_grad_()
+        with ctx():
+            out_ref = saved(mlp, x_ref)
+        out_ref.backward(grad.to(out_ref.dtype))
+
+        mod.patch_qwen2_mlp_recompute()
+        x_new = x.clone().requires_grad_()
+        with ctx():
+            out = mlp(x_new)
+        out.backward(grad.to(out.dtype))
+        assert out.dtype == out_ref.dtype
+        assert_close(out, out_ref, 2e-3)
+        assert_close(x_new.grad, x_ref.grad, 2e-3)
+
+        kept = []
+        x_hook = x.clone().requires_grad_()
+        with torch.autograd.graph.saved_tensors_hooks(
+                lambda t: (kept.append(t.data_ptr()), t)[1], lambda t: t), ctx():
+            mod.MLPInputRecompute.apply(x_hook, mlp.gate_proj, mlp.up_proj)
+        assert kept == [x_hook.data_ptr()]
+    finally:
+        cls.forward = saved
+
+
+@pytest.mark.parametrize("x_dtype", [F32, F16])
+def test_nf4_mlp_fast_path_matches_the_original_bitwise(x_dtype):
+    """The 4-bit layout of the real run: bitsandbytes Linear4bit gate/up/down (fp16 compute),
+    fp32 MLP input, fp16 autocast. The fast path (one input cast, fp16 gate/up and gradients)
+    must equal the module-calling recompute path bit for bit, and the original forward to
+    rounding (silu itself differs from torch's in the last fp32 bit)."""
+    bnb = pytest.importorskip("bitsandbytes")
+    modeling = pytest.importorskip("transformers.models.qwen2.modeling_qwen2")
+    from solution import swiglu_recompute as mod
+
+    torch.manual_seed(0)
+    config = modeling.Qwen2Config(hidden_size=256, intermediate_size=704, hidden_act="silu")
+    mlp = modeling.Qwen2MLP(config)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        dense = getattr(mlp, name)
+        layer = bnb.nn.Linear4bit(dense.in_features, dense.out_features, bias=False,
+                                  compute_dtype=torch.float16, quant_type="nf4")
+        layer.weight = bnb.nn.Params4bit(dense.weight.data.half(), requires_grad=False,
+                                         quant_type="nf4")
+        setattr(mlp, name, layer)
+    mlp = mlp.cuda()
+    assert mod._nf4_pair(mlp.gate_proj, mlp.up_proj, torch.zeros(1, device="cuda")) is not None
+
+    cls = modeling.Qwen2MLP
+    saved = cls.forward
+    x = (torch.randn(3, 80, 256, device="cuda") * 2).to(x_dtype)
+    grad = torch.randn(3, 80, 256, device="cuda").to(x_dtype)
+    try:
+        x_ref = x.clone().requires_grad_()
+        with torch.autocast("cuda", dtype=F16):
+            out_ref = saved(mlp, x_ref)
+        out_ref.backward(grad)
+
+        mod.patch_qwen2_mlp_recompute()
+        x_new = x.clone().requires_grad_()
+        with torch.autocast("cuda", dtype=F16):
+            out = mlp(x_new)
+        out.backward(grad)
+
+        real_pair = mod._nf4_pair
+        mod._nf4_pair = lambda *a: None  # force the module-calling recompute path
+        try:
+            x_mod = x.clone().requires_grad_()
+            with torch.autocast("cuda", dtype=F16):
+                out_mod = mlp(x_mod)
+            out_mod.backward(grad)
+        finally:
+            mod._nf4_pair = real_pair
+
+        assert out_ref.dtype == out_mod.dtype == x_dtype
+        # the fast path hands the 4-bit down_proj its fp16 input directly, so the MLP output is
+        # fp16: the same numbers the reference returns after its fp16 matmul and upcast
+        assert out.dtype == F16
+        assert torch.equal(out.to(x_dtype), out_mod)
+        assert torch.equal(x_new.grad, x_mod.grad)
+        assert_close(out, out_ref, 2e-3)
+        assert_close(x_new.grad, x_ref.grad, 2e-3)
+    finally:
+        cls.forward = saved
+
+
 def test_patch_falls_back_for_cpu_and_other_activations():
     modeling = pytest.importorskip("transformers.models.qwen2.modeling_qwen2")
     from solution import swiglu_recompute as mod
@@ -263,9 +368,11 @@ def test_apply_uses_the_new_mlp_patch_not_the_example():
 
     mlp_saved = modeling.Qwen2MLP.forward
     norm_saved = modeling.Qwen2RMSNorm.forward
+    rope_saved = modeling.apply_rotary_pos_emb
     try:
         solution.apply()
         assert getattr(modeling.Qwen2MLP.forward, "_swiglu_recompute", False)
     finally:
         modeling.Qwen2MLP.forward = mlp_saved
         modeling.Qwen2RMSNorm.forward = norm_saved
+        modeling.apply_rotary_pos_emb = rope_saved

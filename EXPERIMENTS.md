@@ -1,10 +1,198 @@
 # Experiments
 
-| date | commit | version | time | peak mem | eval loss |
-|---|---|---|---|---|---|
-| 2026-10-30 | no-git | base Soup, T4, repeats 1 | 83.3 s | 14345 MiB | 2.04965 |
-| 2026-10-30 | no-git | base Soup, repeat 2 (T4) | 80.1 s | 14345 MiB | 2.04967 |
-| 2026-10-31 | no-git | RMSNorm v1 (Builder handoff), T4, check_rules 9/10 (rule 4 FAIL: own kernels 1.5% of time) | 80.2 s (base 79.3 s) | 12383 MiB (base 14345) | 2.04965 (-0.001%) |
-| 2026-10-31 | c2ec325 (tag safe-v1) | RMSNorm + SwiGLU-recompute (handoff_1), T4, check_rules 10/10, own kernels 7.6% of time (8.1% in solution-only run) | 81.2 s (base 80.2 s) | 12383 MiB (base 14345) | 2.04965 (base 2.04968) |
+Kaggle T4 numbers come from `harness/run_task.py` and `harness/check_rules.py` of the kit;
+local numbers (RTX 4060, Windows) are only for tests and rough memory estimates.
 
-Own-kernel profile (full run): silu_mul_bwd_recompute 489.3 ms (448 launches), silu_mul_fwd_persistent 288.4 ms (448), qwen_rmsnorm_bwd_kernel 98.8 ms (896), qwen_rmsnorm_fwd_kernel 68.0 ms (912).
+| date | commit | version | where | soup train, s | peak, MiB | eval loss | own kernels share | checks |
+|---|---|---|---|---|---|---|---|---|
+| 2026-10-30 | — | base Soup 0.77.0 | T4 | 79-80 (83.3 in one run) | 14345 | 2.04968 | — | — |
+| 2026-10-30 | — | base Soup, repeat 2 | T4 | 80.1 | 14345 | 2.04967 | — | — |
+| 2026-10-31 | no-git | RMSNorm v1 (Builder handoff) | T4 | 80.2 (base 79.3) | 12383 (base 14345) | 2.04965 (-0.001%) | 1.5% | 9/10 (rule 4 FAIL: own kernels 1.5% of time) |
+| 2026-10-31 | c2ec325 (safe-v1) | RMSNorm + SwiGLU-recompute (handoff_1) | T4 | 81.2 (base 80.2 in the same session) | 12383 (base 14345) | 2.04965 (base 2.04968) | 7.6% (8.1% in the solution-only run) | 10/10 |
+| 2026-10-31 | wip | + fused head/loss/metrics (lm_head_loss.py) | local 4060, tiny Qwen2 | — | 882 → 257 (tiny model) | gaps ≤0.01% vs base | — | tests_local 105/105, tests/ 79/79 |
+| 2026-10-31 | f386eca (safe-v2, local tag) | RMSNorm + SwiGLU + fused head | T4, run 1 of 5, `--repeats 1 --profile` | 70.9 (base 86.3 in the same session) | 8483 (base 14345) | 2.04963 (base 2.04967, -0.002%) | 9.7% | 10/10 |
+
+safe-v1 own-kernel profile (full run): silu_mul_bwd_recompute 489.3 ms (448 launches), silu_mul_fwd_persistent 288.4 ms (448), qwen_rmsnorm_bwd_kernel 98.8 ms (896), qwen_rmsnorm_fwd_kernel 68.0 ms (912).
+
+The RMSNorm-v1 handoff row comes from `main` before the wip merge: it is the commit that failed rule 4
+(1.5% of time in own kernels) and motivated the SwiGLU-recompute kernels of safe-v1.
+
+Run 1 details (Kaggle T4, same session, base and solution once each):
+- base: wall 86.28 s, train loop 53.78 s, median step 0.856 s, nvidia-smi peak 14345 MiB, torch max allocated 13373 MiB / reserved 14202 MiB.
+- solution: wall 70.9 s, train loop 49.11 s, nvidia-smi peak 8483 MiB, torch max allocated 8135 MiB / reserved 8340 MiB, `apply()` 7.51 s; speedup 1.217x, memory ratio 1.691x.
+- check 6: first step 0.01%, mean of all steps 0.01%; check 8: time x0.822, memory x0.591.
+- own kernel time over timed steps (ms): silu_mul_bwd_recompute 1927.7, silu_mul_fwd_persistent 1139.0, qwen_rmsnorm_bwd_kernel 488.2, lm_head_xent_rows_kernel 361.1, qwen_rmsnorm_fwd_kernel 287.6 (timed loop 43.29 s).
+- profiler top (16 steps, 10.56 s GPU): fp16 GEMMs 20.1% + 15.0% + 7.7%; fp32<->fp16 copies 8.5% + 8.1%; NF4 dequant 5.3%; SDPA backward 5.2%.
+- tests_local on Kaggle: 103 passed, 2 failed — both `test_lm_head_trainer` variants: Kaggle exposes two T4s, so the test's Trainer wraps the model in DataParallel and the fused head's backward failed (`size of tensor a (864) must match ... b (2)`). The harness runs with `CUDA_VISIBLE_DEVICES=0`, so the measured runs were not affected; fixed in the next commit by falling back to TRL's path under DataParallel.
+
+| 2026-10-31 | 67d0625 | + MLP gate/up recomputed in backward, DataParallel fallback | T4, run 2 of 5, `--repeats 1 --profile` | 78.8 (base 75.7 in the same session) | 4803 (base 14345) | 2.04964 (base 2.04965, -0.000%) | 8.3% | 10/10 |
+
+Run 2 details:
+- base: wall 75.66 s, train loop 53.72 s; solution: wall 78.77 s, train loop 56.96 s, timed loop 51.00 s; speedup 0.961x, memory ratio 2.987x.
+- check 6: first step 0.01%, mean 0.01%; check 8: time x1.041, memory x0.335.
+- own kernel time (ms): silu_mul_bwd_recompute 1928.4, silu_mul_fwd_persistent 1138.6, qwen_rmsnorm_bwd 491.2, lm_head_xent_rows 367.9, qwen_rmsnorm_fwd 287.3.
+- profiler (16 steps): total GPU 12.55 s (run 1: 10.56 s); fp32<->fp16 copies 10.1% + 7.2% (1263 + 906 ms), NF4 dequant 728 ms (561 ms in run 1): the recompute costs GEMMs, dequantisation and dtype casts.
+- tests_local on Kaggle with CUDA_VISIBLE_DEVICES=0: 107/107.
+- The base wall time moved from 86.3 s (run 1) to 75.7 s (run 2) between sessions: wall-time ratios are noisy at this level.
+
+| 2026-10-31 | fb7a219 | + NF4 fast path for the MLP recompute, fewer Triton specialisations | T4, run 3 of 5, `--repeats 1 --profile` | 75.4 (base 76.0 in the same session) | 4803 (base 14345) | 2.04968 (base 2.04961, +0.003%) | 6.2% | 10/10 |
+
+Run 3 details:
+- base: wall 76.05 s, train loop 53.86 s; solution: wall 75.36 s, train loop 53.24 s, timed loop 47.54 s; speedup 1.009x, memory ratio 2.987x.
+- check 6: first step 0.01%, mean 0.01%; check 8: time x0.991, memory x0.335.
+- own kernel time (ms): silu_mul_bwd_recompute 1135.5, silu_mul_fwd_persistent 785.3, qwen_rmsnorm_bwd 405.0, lm_head_xent_rows 345.0, qwen_rmsnorm_fwd 288.8 -> 6.2% (the SwiGLU kernels now read fp16 gate/up, so they take less time; the share dropped with them).
+- profiler (16 steps): total GPU 12.29 s.
+- tests_local on Kaggle with CUDA_VISIBLE_DEVICES=0: 109/109.
+
+| 2026-10-31 | fa1f25d | + fused head walks the vocabulary in chunks (no full fp16 head weight) | T4, run 4 of 5, `--repeats 1 --profile` | 75.2 (base 76.0 in the same session) | 4283 (base 14345) | 2.04966 (base 2.04967, -0.000%) | 6.8% | 10/10 |
+
+Run 4 details:
+- base: wall 76.01 s, train loop 54.0 s; solution: wall 75.15 s, train loop 52.99 s, timed loop 47.14 s; speedup 1.011x, memory ratio 3.349x.
+- check 6: first step 0.01%, mean 0.01%; check 8: time x0.989, memory x0.299.
+- own kernel time (ms): silu_mul_bwd_recompute 1135.1, silu_mul_fwd_persistent 785.5, lm_head_vocab_chunk 574.0, qwen_rmsnorm_bwd 404.5, qwen_rmsnorm_fwd 289.9 -> 6.8%.
+- profiler (16 steps): total GPU 11.51 s (run 3: 12.29 s).
+- check 3 notes that `lm_head_xent_rows_kernel` (the fallback path's kernel) did not run; it is only used when the model returns logits after all.
+- tests_local on Kaggle with CUDA_VISIBLE_DEVICES=0: 112/112.
+
+| 2026-10-31 | 572c891 | + fused RoPE (qwen_rope_kernel) | T4, run 5 of 5, `--repeats 1 --profile` | 74.0 (base 76.1 in the same session) | 4263 (base 14345) | 2.04970 (base 2.04965, +0.002%) | 7.7% | 10/10 |
+
+Run 5 details:
+- base: wall 76.06 s, train loop 53.89 s; solution: wall 74.05 s, train loop 51.94 s, timed loop 45.82 s; speedup 1.027x, memory ratio 3.365x.
+- check 6: first step 0.02%, mean 0.01%; check 8: time x0.974, memory x0.297.
+- own kernel time (ms): silu_mul_bwd_recompute 1135.6, silu_mul_fwd_persistent 786.1, lm_head_vocab_chunk 578.9, qwen_rmsnorm_bwd 404.6, qwen_rope 350.6, qwen_rmsnorm_fwd 290.9 -> 7.7%.
+- profiler (16 steps): total GPU 11.15 s (run 4: 11.51 s).
+- tests_local on Kaggle with CUDA_VISIBLE_DEVICES=0: 126/126.
+
+## Summary of the session (2026-10-31, Kaggle T4, `--repeats 1` each; base re-measured in every run)
+
+| version | commit | soup train, s (base) | peak MiB | eval loss (base) | own kernels | checks |
+|---|---|---|---|---|---|---|
+| safe-v1 | c2ec325 | ~80 (79-80) | 12383 | 2.04965 (2.04968) | >=5% | 10/10 |
+| + fused head | f386eca | 70.9 (86.3) | 8483 | 2.04963 (2.04967) | 9.7% | 10/10 |
+| + MLP recompute | 67d0625 | 78.8 (75.7) | 4803 | 2.04964 (2.04965) | 8.3% | 10/10 |
+| + NF4 fast path | fb7a219 | 75.4 (76.0) | 4803 | 2.04968 (2.04961) | 6.2% | 10/10 |
+| + vocab-chunked head | fa1f25d | 75.2 (76.0) | 4283 | 2.04966 (2.04967) | 6.8% | 10/10 |
+| + fused RoPE | 572c891 | 74.0 (76.1) | 4263 | 2.04970 (2.04965) | 7.7% | 10/10 |
+
+Wall times move by ~10 s between sessions (base: 75.7-86.3 s), so compare each version with the base of the same run.
+
+## Session 2026-10-31 evening: memory 2300 MiB / time 40 s attempt
+
+### Step 0 (no code changes)
+
+Own kernel share of 572c891 (run 5) without the two SwiGLU kernels (silu_mul_fwd_persistent,
+silu_mul_bwd_recompute): (578.9 + 404.6 + 350.6 + 290.9) ms / 45.82 s = **3.5%** (7.7% with
+them). Under 5%, so a kernel that is clearly ours is needed: the attention kernels below.
+
+Memory balance of 572c891 (peak 4263 MiB, nvidia-smi). Fixed parts measured locally on a
+random-weight model with the real Qwen2.5-1.5B shapes (4 and 28 layers scale linearly),
+activations per token and layer from `saved_tensors_hooks` with 4 x 512 tokens:
+
+| item | MiB at the peak | how known |
+|---|---|---|
+| CUDA context, non-torch | ~140 | run 1: nvidia-smi 8483 vs reserved 8340 |
+| NF4 weights + quant states, 28 layers | ~645 | local: 22.3 MiB per layer + absmax |
+| tied embedding / head, fp32 | 890 | 151936 x 1536 x 4 B |
+| LoRA params + grads + Adam (q/v, r=16, 2.2 M) | ~35 | 2.2 M x 16 B |
+| activations kept for backward | ~2550 | rest; 70.1 KB/token/layer x 28 layers -> ~1300 tokens in the largest batch |
+
+Activations kept per token and layer (572c891): SDPA in fp32 (q/k/v come out of the 4-bit
+projections in fp32, k/v expanded to 12 heads) 43.0 KB; RMSNorm inputs (fp32) 12.3 KB; LoRA A
+inputs (fp16) 6.3 KB; MLP input (fp32) 6.1 KB; dropout masks 2.3 KB.
+
+### Run 1 of 5 (Kaggle T4, `--repeats 1 --profile`): 0727b36, own attention + fp16 MLP input
+
+| commit | soup train, s (base same run) | peak MiB (nvidia-smi) | torch alloc / reserved | eval loss vs base | own kernels (w/o SwiGLU) | checks |
+|---|---|---|---|---|---|---|
+| 0727b36 | 160.4 (87.2) | 3933 | 3507 / 3550 | -0.002% | 70.5% (68.8%) | 9/10 (check 8: time x1.840) |
+
+- Rejected: `qwen_attn_fwd_kernel` 22 ms per call on the T4 (0.13 ms on the RTX 4060). A
+  micro-benchmark in the same Kaggle session (bench_attn.py) shows why: Triton 3.6 on sm75 emits
+  no `mma.sync` for `tl.dot` (FMA only, 1798 register spills at 64x64 tiles); fwd+bwd 40 ms
+  against 2.6 ms for torch's fp16 SDPA (8.7 ms fp32). The kernel stays in solution/attention.py
+  but `apply()` no longer uses it (45464f8).
+- Memory: -330 MiB vs 572c891, much less than the local estimate. Under fp16 autocast the base
+  SDPA keeps fp16 (expanded) q/k/v on the T4 (~10 KB/token/layer, bench_sdpa.py), not the fp32
+  tensors seen on the RTX 4060 without a mask; the attention saving was mostly illusory.
+- `is_causal + enable_gqa` (no k/v expansion) is no alternative: torch falls back to a path that
+  keeps 35 KB/token and is slower (bench_sdpa.py).
+
+### Run 2 of 5: ac0ce46 (no own attention; fp16 tied embedding, fp16 MLP input/output, RMSNorm keeps fp16 normalised value, 16 MB head chunks)
+
+| commit | soup train, s (base same run) | peak MiB (nvidia-smi) | torch alloc / reserved | eval loss vs base | own kernels (w/o SwiGLU) | checks |
+|---|---|---|---|---|---|---|
+| ac0ce46 | 74.1 (78.0), s = 1.053 | **3303** (572c891: 4263) | 3033 / 3160 | -0.002% | 7.1% (3.75%) | **10/10** |
+
+- check 6: first step 0.02%, mean of all steps 0.01%; check 8: time x0.949, memory x0.230.
+- own kernel ms (timed loop 45.27 s): silu_mul_bwd_recompute 964.5, lm_head_vocab_chunk 638.6,
+  silu_mul_fwd_persistent 563.0, qwen_rmsnorm_fwd 365.3, qwen_rope 349.1, qwen_rmsnorm_bwd 344.7.
+- Accepted as the new base of the branch (better memory, time not worse).
+- Real-model probe in the same session (memreal.py, 4 x 340 tokens): kept for backward per token
+  and layer: SDPA 13.0 KB (fp16, expanded k/v), LoRA A inputs 6.3 KB, RMSNorm 6.1 KB, MLP 3.1 KB,
+  dropout masks 3.0 KB; load-time peak 1990 MiB allocated while prepare_model_for_kbit_training
+  upcasts the embedding (a floor for the whole run).
+
+### Run 3 of 5: 8f6a67f (+ own NF4 dequant kernel, LoRA branch with bit-packed dropout mask, grouped SDPA)
+
+| commit | soup train, s (base same run) | peak MiB (nvidia-smi) | torch alloc / reserved | eval loss vs base | own kernels (w/o SwiGLU) | checks |
+|---|---|---|---|---|---|---|
+| 8f6a67f | 76.8 (78.4), s = 1.022 | **3157** | 2776 / 3014 | +0.001% | **14.7% (11.3%)** | 10/10 |
+
+- check 6: first step 0.02%, mean 0.01%; check 8: time x0.979, memory x0.220.
+- train loop 52.79 s, timed loop 44.29 s (run 2: 51.97 / 45.27), median step 0.725 s (run 2:
+  0.753, base 0.861): the steady state is 14.5% faster than the base, but the first two steps
+  take 8.5 s against 2.4 s for the base (Triton JIT of our ~12 kernel variants on Kaggle's CPU;
+  the harness gives every run a fresh TRITON_CACHE_DIR, so this is a fair cost). Wall time is
+  therefore only 2% better than the base; vs 572c891 (x0.972 of its base) it is 0.7% worse,
+  within the 3% allowed.
+- own kernel ms (timed loop 44.29 s): nf4_dequant 2666, silu_mul_bwd_recompute 964,
+  lm_head_vocab_chunk 584, silu_mul_fwd_persistent 564, qwen_rmsnorm_fwd 382, qwen_rope 374,
+  lora_dropout_unpack 366, qwen_rmsnorm_bwd 353, lora_dropout_pack 265.
+- In the same session (bench_sdpa.py, bench_nf4.py on the T4): grouped SDPA 3.2 ms vs 12.2 ms per
+  layer fwd+bwd; our NF4 dequant 200 us vs 303 us (8960x1536).
+- tests_local on Kaggle: 2 LoRA tests failed with an ImportError from peft's torchao dispatch
+  (their toy model was not marked 4-bit, so peft looked further than bitsandbytes); fixed in the
+  tests (856ac36), the run itself uses peft's bitsandbytes LoRA layer.
+
+### Run 4 of 5: 2159f8b (+ RMSNorm keeps the fp16 copy of its output, shared with the q/v LoRA and MLP inputs)
+
+| commit | soup train, s (base same run) | peak MiB (nvidia-smi) | torch alloc / reserved | eval loss vs base | own kernels (w/o SwiGLU) | checks |
+|---|---|---|---|---|---|---|
+| 2159f8b | 77.2 (78.3), s = 1.014 | **2837** | 2446 / 2694 | +0.002% | 14.8% (11.4%) | 10/10 |
+
+- check 6: first step 0.02%, mean 0.01%; check 8: time x0.986, memory x0.198.
+- timed loop 44.04 s, median step 0.722 s (base 0.860).
+- Review afterwards: backward recovers n = y16 / w; for |w| ~ 1e-5 the absolute fp16 floor
+  divided by w gives up to ~1e-2 relative error in those channels. normcheck.py on the cached
+  Qwen2.5-1.5B: 35 of 57 norms have |w| < 2^-10 (min 6.5e-6), at most 17 such columns per norm.
+  Fixed in 3e1da26: those columns keep their fp16 normalised value in a small side buffer.
+
+### Run 5 of 5: 3e1da26 (RMSNorm side buffer for tiny-|w| columns; the recommended version)
+
+| commit | soup train, s (base same run) | peak MiB (nvidia-smi) | torch alloc / reserved | eval loss vs base | own kernels (w/o SwiGLU) | checks |
+|---|---|---|---|---|---|---|
+| 3e1da26 | 77.1 (78.3), s = 1.016 | **2839** | 2447 / 2696 | +0.000% | 15.0% (11.5%) | **10/10** |
+
+- check 6: first step 0.02%, mean 0.01%; check 8: time x0.984, memory x0.198.
+- timed loop 44.07 s, median step 0.721 s (base 51.84 s / 0.857 s); first two steps ~8.7 s
+  (Triton JIT of 10 kernel variants, fresh cache per run) against ~2.4 s for the base.
+- own kernel ms: nf4_dequant 2667, silu_mul_bwd_recompute 965, lm_head_vocab_chunk 583,
+  silu_mul_fwd_persistent 564, qwen_rmsnorm_fwd 439, qwen_rope 377, qwen_rmsnorm_bwd 373,
+  lora_dropout_unpack 365, lora_dropout_pack 266.
+- Reviews of the last commit: no blocking issue; open nits: dead `_NO_ZEROS`, a `w == 0` guard
+  in `w_safe` against weights changed without a version bump, `_SMALL` could be a weak dict.
+
+## Summary of the evening session (Kaggle T4, `--repeats 1 --profile`, base re-measured each run)
+
+| version | commit | soup train, s (base) | s | peak MiB | eval loss vs base | own kernels (w/o SwiGLU) | checks |
+|---|---|---|---|---|---|---|---|
+| start of the session | 572c891 | 74.0 (76.1) | 1.027 | 4263 | +0.002% | 7.7% (3.5%) | 10/10 |
+| own Triton attention | 0727b36 | 160.4 (87.2) | 0.543 | 3933 | -0.002% | 70.5% (68.8%) | 9/10 (time) |
+| fp16 embedding, MLP fp16 in/out, RMSNorm fp16 | ac0ce46 | 74.1 (78.0) | 1.053 | 3303 | -0.002% | 7.1% (3.75%) | 10/10 |
+| + NF4 kernel, LoRA bit mask, grouped SDPA | 8f6a67f | 76.8 (78.4) | 1.022 | 3157 | +0.001% | 14.7% (11.3%) | 10/10 |
+| + shared fp16 norm output | 2159f8b | 77.2 (78.3) | 1.014 | 2837 | +0.002% | 14.8% (11.4%) | 10/10 |
+| + tiny-|w| side buffer | **3e1da26** | 77.1 (78.3) | 1.016 | **2839** | +0.000% | **15.0% (11.5%)** | **10/10** |
+
+Targets: 2300 MiB and 40 s were not reached. Peak 4263 -> 2839 MiB (-33%); steady-state step
+-16% vs the base (0.721 vs 0.857 s), wall time -1.6% only, because of ~6 s of Triton JIT in the
+first steps and ~24 s of fixed start-up/loading.
