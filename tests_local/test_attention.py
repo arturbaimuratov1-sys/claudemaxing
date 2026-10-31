@@ -173,3 +173,37 @@ def test_smaller_blocks_same_result(blocks):
         A._BLOCKS.update(saved)
     for a, b in zip(got, ref):
         assert ((a - b).norm() / b.norm()).item() < 2e-3
+
+
+def test_grouped_sdpa_matches_transformers_path():
+    """Per-kv-head SDPA with stride-0 k/v: outputs equal to repeat_kv + SDPA under fp16 autocast,
+    gradients equal to fp16 rounding."""
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward as reference
+
+    from solution.attention import _grouped_sdpa
+
+    class M:
+        num_key_value_groups = 6
+        is_causal = True
+
+    torch.manual_seed(0)
+    B, H, KVH, T, D = 4, 12, 2, 90, 128
+    mask, pad = masks([90, 70, 33, 2], T)
+    q = torch.randn(B, T, H, D, device="cuda").transpose(1, 2).requires_grad_(True)
+    k = torch.randn(B, T, KVH, D, device="cuda").transpose(1, 2).requires_grad_(True)
+    v = torch.randn(B, T, KVH, D, device="cuda").transpose(1, 2).requires_grad_(True)
+    g = torch.randn(B, T, H, D, device="cuda")
+    res = []
+    for f in (lambda: reference(M(), q, k, v, mask, scaling=D ** -0.5)[0],
+              lambda: _grouped_sdpa(q, k, v, mask, D ** -0.5)):
+        for x in (q, k, v):
+            x.grad = None
+        with torch.autocast("cuda", dtype=torch.float16):
+            out = f()
+        out.float().backward(g)
+        res.append((out.detach(), q.grad.clone(), k.grad.clone(), v.grad.clone()))
+    (o1, *g1), (o2, *g2) = res
+    assert o1.dtype == o2.dtype and o1.shape == o2.shape
+    assert torch.equal(o1, o2)
+    for a, b in zip(g1, g2):
+        assert ((a - b).norm() / b.norm()).item() < 1e-3

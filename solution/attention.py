@@ -330,3 +330,47 @@ def patch_qwen2_attention():
 
     sdpa_attention_forward._qwen_triton = True
     AttentionInterface._global_mapping["sdpa"] = sdpa_attention_forward
+
+
+def _grouped_sdpa(query, key, value, attention_mask, scaling):
+    """torch SDPA once per kv head, its query heads against k/v expanded as stride-0 views:
+    the same products as transformers' repeat_kv path, without materialising the copies."""
+    groups = key.shape[1]
+    per = query.shape[1] // groups
+    B, _, T, D = query.shape
+    outs = [torch.nn.functional.scaled_dot_product_attention(
+        query[:, j * per:(j + 1) * per],
+        key[:, j:j + 1].expand(B, per, key.shape[2], D),
+        value[:, j:j + 1].expand(B, per, value.shape[2], D),
+        attn_mask=attention_mask, dropout_p=0.0, scale=scaling) for j in range(groups)]
+    return torch.cat(outs, 1).transpose(1, 2).contiguous()
+
+
+def patch_qwen2_grouped_sdpa():
+    """transformers' "sdpa" attention for grouped-query models with a boolean mask: torch SDPA
+    per kv head (see _grouped_sdpa) instead of repeat_kv + one call. Same kernel, same values;
+    anything else (no groups, dropout, sliding window, no mask, other masks) is unchanged."""
+    from transformers.modeling_utils import AttentionInterface
+
+    current = AttentionInterface._global_mapping.get("sdpa")
+    if current is None or getattr(current, "_grouped_sdpa", False):
+        return
+    original = current
+
+    def sdpa_attention_forward(module, query, key, value, attention_mask, dropout=0.0,
+                               scaling=None, is_causal=None, **kwargs):
+        groups = getattr(module, "num_key_value_groups", 1)
+        if (groups <= 1 or dropout != 0.0 or not isinstance(attention_mask, torch.Tensor)
+                or attention_mask.dtype != torch.bool or attention_mask.dim() != 4
+                or kwargs.get("sliding_window") is not None
+                or kwargs.get("position_bias") is not None
+                or kwargs.get("output_attentions", False)
+                or not all(isinstance(x, torch.Tensor) and x.dim() == 4 and x.is_cuda
+                           for x in (query, key, value))
+                or query.shape[1] != key.shape[1] * groups or key.shape != value.shape):
+            return original(module, query, key, value, attention_mask, dropout=dropout,
+                            scaling=scaling, is_causal=is_causal, **kwargs)
+        return _grouped_sdpa(query, key, value, attention_mask, scaling), None
+
+    sdpa_attention_forward._grouped_sdpa = True
+    AttentionInterface._global_mapping["sdpa"] = sdpa_attention_forward

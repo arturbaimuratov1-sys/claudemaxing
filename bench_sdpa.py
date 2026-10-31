@@ -21,11 +21,21 @@ def base():
     return F.scaled_dot_product_attention(q, kk, vv, attn_mask=mask)
 
 
+def grouped():
+    """one SDPA call per kv head, k/v expanded as stride-0 views (no copy in our code)"""
+    g = H // KVH
+    q16, k16, v16 = q.half(), k.half(), v.half()
+    return torch.cat([F.scaled_dot_product_attention(
+        q16[:, j * g:(j + 1) * g], k16[:, j:j + 1].expand(B, g, T, D),
+        v16[:, j:j + 1].expand(B, g, T, D), attn_mask=mask) for j in range(KVH)], 1)
+
+
 def gqa():
     return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
 
 
-for name, f in (("base repeat_kv+mask", base), ("is_causal+enable_gqa", gqa)):
+for name, f in (("base repeat_kv+mask", base), ("grouped stride-0 k/v", grouped),
+                ("is_causal+enable_gqa", gqa)):
     try:
         with torch.autocast("cuda", dtype=torch.float16):
             out = f()
