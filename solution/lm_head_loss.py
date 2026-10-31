@@ -35,6 +35,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .embedding import shrink_tied_embedding
+
 IGNORE_INDEX = -100
 # Pass 2 writes the per-row gradient scaled by this power of two (exact in any float format),
 # so the small probabilities of a 152K vocabulary do not flush to zero in fp16; backward
@@ -313,6 +315,7 @@ def patch_qwen2_causal_lm_head():
             return original(self, *args, **kwargs)
         kwargs.pop("labels")
         kwargs.pop("logits_to_keep", None)
+        shrink_tied_embedding(self)  # fp16 storage of the tied weight, lossless (embedding.py)
         outputs = self.model(**kwargs)
         hidden = outputs.last_hidden_state
         head = self.lm_head
