@@ -4,17 +4,17 @@ In the base run the head builds a [batch, seq, vocab] logits tensor (vocab ~152K
 and five consumers walk it: the loss (an fp32 upcast copy and a log-softmax kept for
 backward), accelerate's fp32 copy of the model output, TRL's entropy, TRL's token accuracy (a
 contiguous copy of logits[:, :-1]) and Soup's per-row losses for rewind.jsonl. Here the head
-runs `chunk_rows` positions at a time; for each chunk one Triton program per row makes two
-passes over the vocabulary:
+walks the vocabulary in column chunks (`chunk_cols` columns of the weight, cast to fp16 one
+chunk at a time); for each chunk one Triton program per row makes two passes over the block:
 
-  pass 1: running max and sum of exp (log-sum-exp), the running sum of exp(z) * z (entropy),
-          the argmax (accuracy) and the label's logit (loss);
-  pass 2: the gradient of the loss with respect to that row's logits, written over the logits
-          in place, which one matmul with the frozen head weight turns into the gradient of the
-          hidden state.
+  pass 1: carries the row's running max and sum of exp (log-sum-exp), running sum of
+          exp(z) * z (entropy), argmax (accuracy) and the label's logit (loss) across chunks;
+  pass 2: writes the softmax of the block against the running log-sum-exp over the logits in
+          place, which one matmul with the frozen weight chunk turns into this chunk's part of
+          the hidden-state gradient; earlier parts are rescaled by exp(lse_before - lse_after).
 
-The chunk is then dropped, so the head never holds more than one chunk of logits. The loss is
-a scalar, so the hidden-state gradient is computed in forward and only scaled in backward.
+Neither the full logits nor a full fp16 copy of the head weight ever exist. The loss is a
+scalar, so the hidden-state gradient is computed in forward and only scaled in backward.
 
 The numbers follow the base path, measured in the installed libraries: under accelerate's fp16
 autocast the head runs in fp16 even though the hidden state (after a final norm with an fp32
@@ -40,7 +40,7 @@ IGNORE_INDEX = -100
 # so the small probabilities of a 152K vocabulary do not flush to zero in fp16; backward
 # divides it out again together with the loss scale and the denominator.
 GRAD_SCALE = 1024.0
-CHUNK_BYTES = 256 * 2 ** 20  # one chunk of logits at most this big
+CHUNK_BYTES = 64 * 2 ** 20  # one [rows, chunk] block of logits at most this big
 _REQUEST_ATTR = "_fused_head_request"
 _STEP_ATTR = "_fused_head_step"
 try:  # the trainer attribute Soup's rewind recorder reads when a step has no logits
@@ -94,6 +94,70 @@ def lm_head_xent_rows_kernel(logits_ptr, target_ptr, loss_ptr, entropy_ptr, corr
             tl.store(row_ptr + idx, grad.to(logits_ptr.dtype.element_ty), mask=mask)
 
 
+# The training path: the vocabulary is walked in column chunks, so only one chunk of the head
+# weight (cast to fp16) and one [rows, chunk] block of logits exist at a time. Each launch
+# carries every row's running state (max, sum of exp, sum of exp*z, argmax, label logit) from
+# the previous chunk. With WRITE_GRAD it also writes, over the block, the softmax of the block
+# against the row's *running* log-sum-exp, and the factor exp(lse_before - lse_after) by which
+# the rows of the gradient accumulated so far must be rescaled: then the sum over chunks is
+# the gradient against the final log-sum-exp without a second pass or a second matmul. The
+# label's -1 is written into its own chunk's block (rounded with its probability, as in the
+# base path); the part of it that later rescaling removed is put back once at the end.
+@triton.jit(do_not_specialize=["n_cols", "col_offset"])
+def lm_head_vocab_chunk_kernel(logits_ptr, target_ptr, max_ptr, sum_ptr, dot_ptr, best_ptr,
+                               label_logit_ptr, label_lse_ptr, factor_ptr, n_cols, col_offset,
+                               row_stride, grad_scale, BLOCK: tl.constexpr,
+                               WRITE_GRAD: tl.constexpr):
+    row = tl.program_id(0)
+    row_ptr = logits_ptr + row.to(tl.int64) * row_stride
+    target = tl.load(target_ptr + row).to(tl.int32)
+    labelled = target != -100
+    cols = tl.arange(0, BLOCK)
+
+    prev_max = tl.load(max_ptr + row)
+    prev_sum = tl.load(sum_ptr + row)
+    run_max = prev_max
+    run_sum = prev_sum
+    run_dot = tl.load(dot_ptr + row)
+    best = tl.load(best_ptr + row)
+    for start in range(0, n_cols, BLOCK):
+        idx = start + cols
+        mask = idx < n_cols
+        z = tl.load(row_ptr + idx, mask=mask, other=float("-inf")).to(tl.float32)
+        tile_max = tl.max(z, axis=0)
+        # First index of the maximum over the whole vocabulary, as torch.argmax.
+        best = tl.where(tile_max > run_max, tl.argmax(z, axis=0) + start + col_offset, best)
+        new_max = tl.maximum(run_max, tile_max)
+        rescale = tl.exp(run_max - new_max)
+        e = tl.exp(z - new_max)
+        run_sum = run_sum * rescale + tl.sum(e, axis=0)
+        run_dot = run_dot * rescale + tl.sum(tl.where(mask, e * z, 0.0), axis=0)
+        run_max = new_max
+    tl.store(max_ptr + row, run_max)
+    tl.store(sum_ptr + row, run_sum)
+    tl.store(dot_ptr + row, run_dot)
+    tl.store(best_ptr + row, best)
+    local = target - col_offset
+    hit = labelled & (local >= 0) & (local < n_cols)
+    label_logit = tl.load(row_ptr + tl.where(hit, local, 0)).to(tl.float32)
+    tl.store(label_logit_ptr + row, label_logit, mask=hit)
+
+    if WRITE_GRAD:
+        lse = run_max + tl.log(run_sum)
+        tl.store(factor_ptr + row, tl.exp(prev_max + tl.log(prev_sum) - lse))  # 0 on chunk 1
+        tl.store(label_lse_ptr + row, lse, mask=hit)
+        for start in range(0, n_cols, BLOCK):
+            idx = start + cols
+            mask = idx < n_cols
+            z = tl.load(row_ptr + idx, mask=mask, other=0.0).to(tl.float32)
+            prob = tl.exp(z - lse)
+            # The label's -1 goes into its own chunk's block, so it is rounded together with
+            # its probability in the matmul, as in the base path.
+            grad = tl.where(hit & (idx == local), prob - 1.0, prob) * grad_scale
+            grad = tl.where(labelled, grad, 0.0)
+            tl.store(row_ptr + idx, grad.to(logits_ptr.dtype.element_ty), mask=mask)
+
+
 def _launch_shape(n_cols):
     block = min(4096, triton.next_power_of_2(n_cols))
     return block, 8 if block >= 2048 else 4
@@ -125,30 +189,49 @@ def shift_labels_left(labels):
 
 class _FusedHeadLoss(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, target, denominator, compute_dtype, chunk_rows, want_grad):
+    def forward(ctx, hidden, weight, target, denominator, compute_dtype, chunk_cols, want_grad):
         shape = hidden.shape
         h2 = hidden.reshape(-1, shape[-1])
         tgt = target.reshape(-1).contiguous()
         n, vocab = h2.shape[0], weight.shape[0]
-        w = weight.detach().to(compute_dtype)
-        token_loss = torch.empty(n, dtype=torch.float32, device=hidden.device)
-        entropy = torch.empty(n, dtype=torch.float32, device=hidden.device)
-        correct = torch.empty(n, dtype=torch.int32, device=hidden.device)
-        grad_raw = torch.empty(n, shape[-1], dtype=torch.float32, device=hidden.device) \
-            if want_grad else None
-        if chunk_rows is None:
-            # A multiple of 16 rows keeps every slice below 16-byte aligned, so Triton compiles
-            # one variant of the kernel instead of one per alignment (compilation is timed).
-            chunk_rows = max(16, CHUNK_BYTES // (vocab * w.element_size()) // 16 * 16)
-        for start in range(0, n, chunk_rows):
-            stop = min(n, start + chunk_rows)
-            logits = torch.mm(h2[start:stop].to(compute_dtype), w.t())
-            _rows(logits, tgt[start:stop], token_loss[start:stop], entropy[start:stop],
-                  correct[start:stop], want_grad)
-            if want_grad:  # the logits now hold GRAD_SCALE * d(sum of CE)/d(logits)
-                grad_raw[start:stop] = torch.mm(logits, w)
-            del logits
-        del w
+        dev, f32 = hidden.device, torch.float32
+        h_low = h2.to(compute_dtype)
+        run_max = torch.full((n,), float("-inf"), dtype=f32, device=dev)
+        run_sum = torch.zeros(n, dtype=f32, device=dev)
+        run_dot = torch.zeros(n, dtype=f32, device=dev)
+        best = torch.zeros(n, dtype=torch.int32, device=dev)
+        label_logit = torch.zeros(n, dtype=f32, device=dev)
+        label_lse = torch.zeros(n, dtype=f32, device=dev)
+        factor = torch.empty(n, dtype=f32, device=dev)
+        grad_raw = torch.zeros(n, shape[-1], dtype=f32, device=dev) if want_grad else None
+        if chunk_cols is None:  # at least 8192 columns, so few rows do not mean many chunks
+            elem = torch.empty((), dtype=compute_dtype).element_size()
+            chunk_cols = max(8192, CHUNK_BYTES // (max(n, 1) * elem) // 256 * 256)
+        block, warps = _launch_shape(min(chunk_cols, vocab))
+        for c0 in range(0, vocab, chunk_cols):
+            c1 = min(vocab, c0 + chunk_cols)
+            w = weight[c0:c1].detach().to(compute_dtype)
+            logits = torch.mm(h_low, w.t())
+            if n:
+                lm_head_vocab_chunk_kernel[(n,)](
+                    logits, tgt, run_max, run_sum, run_dot, best, label_logit, label_lse, factor,
+                    c1 - c0, c0, logits.stride(0), GRAD_SCALE, BLOCK=block,
+                    WRITE_GRAD=want_grad, num_warps=warps)
+            if want_grad:  # rescale what is accumulated to the new log-sum-exp, add this chunk
+                grad_raw.mul_(factor[:, None]).add_(torch.mm(logits, w))
+            del logits, w
+        lse = run_max + torch.log(run_sum)
+        labelled = tgt != IGNORE_INDEX
+        token_loss = torch.where(labelled, lse - label_logit, torch.zeros_like(lse))
+        entropy = lse - run_dot / run_sum
+        correct = (labelled & (best == tgt)).to(torch.int32)
+        if want_grad:
+            # The label's -1 entered the sum in its chunk and was then rescaled with it by
+            # exp(lse_at_label_chunk - lse); put back the missing (1 - that) part of -W_label.
+            missing = torch.where(labelled, 1.0 - torch.exp(label_lse - lse),
+                                  torch.zeros_like(lse)) * GRAD_SCALE
+            label_rows = weight.detach().index_select(0, tgt.clamp(min=0)).to(compute_dtype)
+            grad_raw.sub_(label_rows.to(f32) * missing[:, None])
         loss = token_loss.sum() / denominator
         ctx.shape, ctx.hidden_dtype, ctx.denominator = shape, hidden.dtype, denominator
         if want_grad:
@@ -169,7 +252,7 @@ class _FusedHeadLoss(torch.autograd.Function):
         return grad, None, None, None, None, None, None
 
 
-def fused_head_loss(hidden, weight, labels, num_items_in_batch=None, chunk_rows=None):
+def fused_head_loss(hidden, weight, labels, num_items_in_batch=None, chunk_cols=None):
     """ForCausalLMLoss(linear(hidden, weight), labels) and the per-token terms the trainer's
     metrics need, without materialising the logits. `weight` must be frozen: the gradient
     goes to `hidden` only. Returns (loss, step) with step.token_loss and step.token_entropy of
@@ -187,7 +270,7 @@ def fused_head_loss(hidden, weight, labels, num_items_in_batch=None, chunk_rows=
         raise TypeError(f"hidden {hidden.dtype} and head {weight.dtype} differ outside autocast")
     want_grad = torch.is_grad_enabled() and hidden.requires_grad
     loss, token_loss, entropy, correct = _FusedHeadLoss.apply(
-        hidden, weight, target, denominator, compute_dtype, chunk_rows, want_grad)
+        hidden, weight, target, denominator, compute_dtype, chunk_cols, want_grad)
     step = SimpleNamespace(token_loss=token_loss, token_entropy=entropy,
                            correct=correct.sum(), labelled=labelled)
     return loss, step

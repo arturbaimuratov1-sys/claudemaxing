@@ -86,14 +86,14 @@ def reference(h, w, labels, num_items, autocast, grad_scale):
     return loss.detach(), entropy, (correct, mask.sum().item()), (rows, tokens), h.grad
 
 
-def ours(h, w, labels, num_items, autocast, grad_scale, chunk_rows=None):
+def ours(h, w, labels, num_items, autocast, grad_scale, chunk_cols=None):
     from solution.lm_head_loss import fused_head_loss
 
     h = h.detach().clone().requires_grad_()
     ctx = torch.autocast("cuda", dtype=F16) if autocast else torch.autocast("cuda", enabled=False)
     with ctx:
         loss, step = fused_head_loss(h, w, labels, num_items_in_batch=num_items,
-                                     chunk_rows=chunk_rows)
+                                     chunk_cols=chunk_cols)
     (loss * grad_scale).backward()
     from soup_cli.trainer.rewind_hf import row_losses_from_token_losses
 
@@ -158,11 +158,32 @@ def test_grad_scaler_scales_match_the_base(scale):
         close(o[4], r[4], 1e-2, "grad of hidden at loss scale %g" % scale)
 
 
+@pytest.mark.parametrize("sharpness", [6.0, 12.0, 24.0])
+def test_confident_labels_match_the_base(sharpness):
+    """Late in training most labels carry p close to 1, where the gradient (p - 1) is small
+    and fp16 rounding matters most. Labels here are the argmax of a sharp distribution."""
+    pytest.importorskip("soup_cli")
+    h, w, labels = make(2, 128, 256, 151936, F32, F32, seed=5, drop=0.1)
+    w = w * sharpness
+    with torch.no_grad(), torch.autocast("cuda", dtype=F16):
+        pred = F.linear(h, w).float().argmax(-1)
+    labels = torch.where(labels == -100, labels, F.pad(pred, (1, 0))[..., :-1])
+    with torch.no_grad(), torch.autocast("cuda", dtype=F16):
+        p = F.linear(h, w).float().softmax(-1).max(-1).values
+    print(f"\nsharpness {sharpness}: median p of the argmax {p.median().item():.4f}")
+    shift = F.pad(labels, (0, 1), value=-100)[..., 1:]
+    n_items = (shift != -100).sum()
+    r = reference(h, w, labels, n_items, True, 65536.0)
+    o = ours(h, w, labels, n_items, True, 65536.0)
+    close(o[0], r[0], 1e-3, "loss")
+    close(o[4], r[4], 1e-2, "grad of hidden, confident labels")
+
+
 def test_chunking_does_not_change_the_result():
     pytest.importorskip("soup_cli")
     h, w, labels = make(3, 70, 128, 3001, F32, F32)
-    a = ours(h, w, labels, None, True, 1.0, chunk_rows=None)
-    b = ours(h, w, labels, None, True, 1.0, chunk_rows=7)
+    a = ours(h, w, labels, None, True, 1.0, chunk_cols=None)
+    b = ours(h, w, labels, None, True, 1.0, chunk_cols=7)
     close(b[0], a[0], 1e-5, "loss")
     close(b[1], a[1], 1e-5, "entropy")
     close(b[4], a[4], 1e-3, "grad")

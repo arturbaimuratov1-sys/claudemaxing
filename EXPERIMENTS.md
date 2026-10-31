@@ -27,3 +27,12 @@ Run 2 details:
 - profiler (16 steps): total GPU 12.55 s (run 1: 10.56 s); fp32<->fp16 copies 10.1% + 7.2% (1263 + 906 ms), NF4 dequant 728 ms (561 ms in run 1): the recompute costs GEMMs, dequantisation and dtype casts.
 - tests_local on Kaggle with CUDA_VISIBLE_DEVICES=0: 107/107.
 - The base wall time moved from 86.3 s (run 1) to 75.7 s (run 2) between sessions: wall-time ratios are noisy at this level.
+
+| 2026-10-31 | fb7a219 | + NF4 fast path for the MLP recompute, fewer Triton specialisations | T4, run 3 of 5, `--repeats 1 --profile` | 75.4 (base 76.0 in the same session) | 4803 (base 14345) | 2.04968 (base 2.04961, +0.003%) | 6.2% | 10/10 |
+
+Run 3 details:
+- base: wall 76.05 s, train loop 53.86 s; solution: wall 75.36 s, train loop 53.24 s, timed loop 47.54 s; speedup 1.009x, memory ratio 2.987x.
+- check 6: first step 0.01%, mean 0.01%; check 8: time x0.991, memory x0.335.
+- own kernel time (ms): silu_mul_bwd_recompute 1135.5, silu_mul_fwd_persistent 785.3, qwen_rmsnorm_bwd 405.0, lm_head_xent_rows 345.0, qwen_rmsnorm_fwd 288.8 -> 6.2% (the SwiGLU kernels now read fp16 gate/up, so they take less time; the share dropped with them).
+- profiler (16 steps): total GPU 12.29 s.
+- tests_local on Kaggle with CUDA_VISIBLE_DEVICES=0: 109/109.
