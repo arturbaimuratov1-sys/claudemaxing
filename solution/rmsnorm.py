@@ -25,9 +25,9 @@ MAX_COLS = 16384
 _SUPPORTED = (torch.float16, torch.bfloat16, torch.float32)
 
 
-@triton.jit
-def qwen_rmsnorm_fwd_kernel(x_ptr, w_ptr, out_ptr, rstd_ptr, low_ptr, n_cols, eps,
-                            BLOCK: tl.constexpr, SAVE_LOW: tl.constexpr):
+@triton.jit(do_not_specialize=["n_small"])
+def qwen_rmsnorm_fwd_kernel(x_ptr, w_ptr, out_ptr, rstd_ptr, low_ptr, slot_ptr, small_ptr,
+                            n_small, n_cols, eps, BLOCK: tl.constexpr, SAVE_LOW: tl.constexpr):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
@@ -41,20 +41,28 @@ def qwen_rmsnorm_fwd_kernel(x_ptr, w_ptr, out_ptr, rstd_ptr, low_ptr, n_cols, ep
     tl.store(out_ptr + offs, (normed * w).to(out_ptr.dtype.element_ty), mask=mask)
     if SAVE_LOW:  # fp16 copy of the output, kept for backward (see RMSNorm.forward)
         tl.store(low_ptr + offs, (normed * w).to(low_ptr.dtype.element_ty), mask=mask)
+        # columns with a tiny |w| also keep their normalised value (slot >= 0)
+        slot = tl.load(slot_ptr + cols, mask=mask, other=-1)
+        tl.store(small_ptr + row * n_small + slot, normed.to(small_ptr.dtype.element_ty),
+                 mask=mask & (slot >= 0))
 
 
 # n_rows changes with every batch; not specialising on it keeps one compiled variant.
-@triton.jit(do_not_specialize=["n_rows"])
-def qwen_rmsnorm_bwd_kernel(dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, dw_part_ptr, n_rows, n_cols,
-                            BLOCK: tl.constexpr, COMPUTE_DW: tl.constexpr,
-                            SAVED_OUTPUT: tl.constexpr):
+@triton.jit(do_not_specialize=["n_rows", "n_small"])
+def qwen_rmsnorm_bwd_kernel(dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, dw_part_ptr, slot_ptr,
+                            small_ptr, n_small, n_rows, n_cols, BLOCK: tl.constexpr,
+                            COMPUTE_DW: tl.constexpr, SAVED_OUTPUT: tl.constexpr):
     # SAVED_OUTPUT: x_ptr holds the fp16 copy of the output (x * rstd) * w of an fp32 x (frozen
-    # weight without zeros, so COMPUTE_DW is False); the normalised value is that divided by w,
-    # and the fp32 reference does no rounding. Otherwise x_ptr holds x.
+    # weight, so COMPUTE_DW is False); the normalised value is that divided by w, except in the
+    # columns with a tiny |w|, whose fp16 normalised values are in small_ptr. The fp32
+    # reference does no rounding. Otherwise x_ptr holds x.
     pid = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
     w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    if SAVED_OUTPUT:
+        slot = tl.load(slot_ptr + cols, mask=mask, other=-1)
+        w_safe = tl.where(slot >= 0, 1.0, w)
     dw_acc = tl.zeros([BLOCK], dtype=tl.float32)
     # Persistent loop: each program walks rows pid, pid + n_programs, ... and keeps its own
     # partial sum of dw; torch adds the partial rows afterwards.
@@ -64,7 +72,9 @@ def qwen_rmsnorm_bwd_kernel(dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, dw_part_ptr,
         dy = tl.load(dy_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         rstd = tl.load(rstd_ptr + row)
         if SAVED_OUTPUT:
-            normed = tl.where(mask, x / w, 0.0)  # masked lanes: w = 0 there
+            small = tl.load(small_ptr + row * n_small + slot, mask=mask & (slot >= 0),
+                            other=0.0).to(tl.float32)
+            normed = tl.where(slot >= 0, small, tl.where(mask, x / w_safe, 0.0))
         else:
             normed = x * rstd
         if COMPUTE_DW:
@@ -95,23 +105,33 @@ _LAST_LOW = [None, -1, None]  # (weakref to the last output, its version, weakre
 _NO_ZEROS = {}
 
 
-# y16 / w keeps 2^-11 relative accuracy while |y| is a normal fp16 number; tiny |w| would
-# amplify the absolute error floor of fp16 subnormals (2^-25 / |w|), so such weights keep the
-# exact path.
+# y16 / w keeps 2^-11 relative accuracy while |y| is a normal fp16 number; a tiny |w| would
+# amplify the absolute error floor of fp16 subnormals (2^-25 / |w|). The columns with
+# |w| < MIN_ABS_WEIGHT (some of Qwen2.5's norms have weights down to 1e-5) keep their
+# normalised value separately, at most MAX_SMALL of them per norm.
 MIN_ABS_WEIGHT = 2.0 ** -10
+MAX_SMALL = 64
+_SMALL = {}
 
 
-def _no_zeros(weight):
-    """True if every |w| of the frozen weight is at least MIN_ABS_WEIGHT (checked once per
-    weight version and storage)."""
+def _small_columns(weight):
+    """(slot map int32 [n_cols]: index among the tiny-|w| columns or -1, their count) for the
+    frozen weight, or None when there are more than MAX_SMALL of them or a non-finite weight.
+    Computed once per weight version and storage."""
     key = id(weight)
-    entry = _NO_ZEROS.get(key)
+    entry = _SMALL.get(key)
     if (entry is None or entry[0]() is not weight or entry[1] != weight._version
-            or entry[3] != weight.data_ptr()):
-        entry = (weakref.ref(weight), weight._version,
-                 bool(weight.abs().min() >= MIN_ABS_WEIGHT), weight.data_ptr())
-        _NO_ZEROS[key] = entry
-    return entry[2]
+            or entry[2] != weight.data_ptr()):
+        small = weight.detach().abs() < MIN_ABS_WEIGHT
+        count = int(small.sum())
+        result = None
+        if count <= MAX_SMALL and bool(torch.isfinite(weight).all()):
+            slots = torch.full(weight.shape, -1, dtype=torch.int32, device=weight.device)
+            slots[small] = torch.arange(count, dtype=torch.int32, device=weight.device)
+            result = (slots, count)
+        entry = (weakref.ref(weight), weight._version, weight.data_ptr(), result)
+        _SMALL[key] = entry
+    return entry[3]
 
 
 def fp16_copy_of(t):
@@ -137,23 +157,32 @@ class RMSNorm(torch.autograd.Function):
         rstd = torch.empty(n_rows, dtype=torch.float32, device=x.device)
         # Activation compression: with an fp32 x and a frozen weight, backward needs x only
         # for the normalised value x * rstd inside dx. The kernel writes the fp16 copy of the
-        # output, (x * rstd) * w, and backward divides it by w (all |w| >= 2^-10): 2^-11
-        # relative per element while the output is a normal fp16 number, dx changes by ~1e-5
-        # relative. That fp16 copy is exactly
+        # output, (x * rstd) * w, and backward divides it by w: 2^-11 relative per element
+        # while the output is a normal fp16 number, dx changes by ~1e-5 relative. Columns with
+        # |w| < 2^-10 (where the division would lose accuracy) keep their fp16 normalised value
+        # in a small side buffer instead (_small_columns). That fp16 copy is exactly
         # what the next layers cast the output to (q/k/v and the MLP compute in fp16), so they
         # take it from here (fp16_copy_of) and keep the same tensor: one copy for all of them.
-        # A trainable weight, or one with tiny or zero entries, keeps the exact fp32 x.
-        low = (torch.empty((n_rows, n_cols), dtype=torch.float16, device=x.device)
-               if x.dtype == torch.float32 and weight.dtype == torch.float32
-               and not weight.requires_grad and ctx.needs_input_grad[0]
-               and _no_zeros(weight) else None)
+        # A trainable weight (or one with many tiny entries) keeps the exact fp32 x.
+        small_cols = (_small_columns(weight)
+                      if x.dtype == torch.float32 and weight.dtype == torch.float32
+                      and not weight.requires_grad and ctx.needs_input_grad[0] else None)
+        low = slots = small = None
+        if small_cols is not None:
+            slots, n_small = small_cols
+            low = torch.empty((n_rows, n_cols), dtype=torch.float16, device=x.device)
+            small = torch.empty((n_rows, max(n_small, 1)), dtype=torch.float16, device=x.device)
         if n_rows:
             block, warps = _launch_shape(n_cols)
-            qwen_rmsnorm_fwd_kernel[(n_rows,)](x2, weight, out, rstd,
-                                               low if low is not None else rstd, n_cols, eps,
-                                               BLOCK=block, SAVE_LOW=low is not None,
-                                               num_warps=warps)
-        ctx.save_for_backward(low if low is not None else x2, weight, rstd)
+            qwen_rmsnorm_fwd_kernel[(n_rows,)](
+                x2, weight, out, rstd, low if low is not None else rstd,
+                slots if slots is not None else rstd, small if small is not None else rstd,
+                small.shape[1] if small is not None else 1, n_cols, eps, BLOCK=block,
+                SAVE_LOW=low is not None, num_warps=warps)
+        if low is not None:
+            ctx.save_for_backward(low, weight, rstd, slots, small)
+        else:
+            ctx.save_for_backward(x2, weight, rstd, rstd, rstd)
         ctx.x_dtype = x.dtype
         ctx.shape = shape
         result = out.view(shape)
@@ -164,7 +193,7 @@ class RMSNorm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
-        x2, weight, rstd = ctx.saved_tensors
+        x2, weight, rstd, slots, small = ctx.saved_tensors
         n_rows, n_cols = x2.shape
         grad2 = grad.contiguous().view(n_rows, n_cols)
         dx = torch.empty(x2.shape, dtype=ctx.x_dtype, device=x2.device)
@@ -175,8 +204,10 @@ class RMSNorm(torch.autograd.Function):
             programs = min(n_rows, 4 * _sm_count(x2.device.index or 0))
             partial = (torch.empty((programs, n_cols), dtype=torch.float32, device=x2.device)
                        if need_dw else rstd)
-            qwen_rmsnorm_bwd_kernel[(programs,)](grad2, x2, weight, rstd, dx, partial, n_rows,
-                                                 n_cols, BLOCK=block, COMPUTE_DW=need_dw,
+            qwen_rmsnorm_bwd_kernel[(programs,)](grad2, x2, weight, rstd, dx, partial, slots,
+                                                 small, small.shape[-1] if small.dim() == 2
+                                                 else 1, n_rows, n_cols, BLOCK=block,
+                                                 COMPUTE_DW=need_dw,
                                                  SAVED_OUTPUT=x2.dtype != ctx.x_dtype,
                                                  num_warps=warps)
             if need_dw:

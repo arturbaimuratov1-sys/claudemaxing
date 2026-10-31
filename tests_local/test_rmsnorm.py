@@ -245,12 +245,33 @@ def test_fp16_copy_of_contract():
     assert fp16_copy_of(y4) is None and fp16_copy_of(y3) is None
     with torch.no_grad():
         assert fp16_copy_of(rmsnorm(x, w, 1e-6)) is None
-    small = w.clone()
-    small[5] = 1e-5
-    assert fp16_copy_of(rmsnorm(x, small, 1e-6)) is None  # tiny |w|: exact path, no copy
-    zero = w.clone()
-    zero[3] = 0.0
-    out = rmsnorm(x, zero, 1e-6)
-    assert fp16_copy_of(out) is None
-    out.sum().backward()
-    assert torch.isfinite(x.grad).all()
+    many_small = w.clone()
+    many_small[:100] = 1e-6  # more tiny entries than the side buffer takes: exact path
+    assert fp16_copy_of(rmsnorm(x, many_small, 1e-6)) is None
+
+
+def test_tiny_and_zero_weights_accurate():
+    """Columns with |w| < 2^-10 (Qwen2.5 has weights down to 1e-5) or w == 0 take their
+    normalised value from the side buffer: dx there as accurate as elsewhere (vs fp64)."""
+    from solution.rmsnorm import fp16_copy_of, rmsnorm
+
+    torch.manual_seed(1)
+    x = (torch.randn(4, 64, 1536, device="cuda") * 3)
+    x[:, :, 9] = 2e5
+    w = torch.rand(1536, device="cuda") * 2 + 0.05
+    tiny = [3, 100, 777, 1500]
+    w[tiny] = torch.tensor([1e-5, -6.5e-6, 3e-4, 0.0], device="cuda")
+    g = torch.randn_like(x)
+    xx = x.clone().requires_grad_(True)
+    out = rmsnorm(xx, w, 1e-6)
+    assert fp16_copy_of(out) is not None
+    assert torch.equal(fp16_copy_of(out), out.to(torch.float16))
+    out.backward(g)
+    x64 = x.double().requires_grad_(True)
+    ref = w.double() * (x64 * torch.rsqrt(x64.pow(2).mean(-1, keepdim=True) + 1e-6))
+    ref.backward(g.double())
+    err = (xx.grad.double() - x64.grad).abs()
+    scale = x64.grad.abs().mean()
+    assert torch.isfinite(xx.grad).all()
+    assert (err[..., tiny].max() / scale).item() < 2e-3, (err[..., tiny].max() / scale).item()
+    assert ((xx.grad.double() - x64.grad).norm() / x64.grad.norm()).item() < 1e-3

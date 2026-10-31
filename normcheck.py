@@ -17,3 +17,11 @@ for f in files:
 mins.sort()
 print(len(mins), "norms; smallest |w|:", mins[:5])
 print("below 2^-10:", sum(m < 2 ** -10 for m, _ in mins))
+counts = []
+for f in files:
+    with safe_open(f, "pt") as s:
+        for k in s.keys():
+            if k.endswith("norm.weight"):
+                counts.append(int((s.get_tensor(k).float().abs() < 2 ** -10).sum()))
+print("tiny-|w| columns per norm: max", max(counts), "total", sum(counts), "norms over 64:",
+      sum(c > 64 for c in counts))
