@@ -38,7 +38,8 @@ def qwen_rmsnorm_fwd_kernel(x_ptr, w_ptr, out_ptr, rstd_ptr, n_cols, eps, BLOCK:
     tl.store(out_ptr + offs, (normed * w).to(out_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.jit
+# n_rows changes with every batch; not specialising on it keeps one compiled variant.
+@triton.jit(do_not_specialize=["n_rows"])
 def qwen_rmsnorm_bwd_kernel(dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, dw_part_ptr, n_rows, n_cols,
                             BLOCK: tl.constexpr, COMPUTE_DW: tl.constexpr):
     pid = tl.program_id(0)

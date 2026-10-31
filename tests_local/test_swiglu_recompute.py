@@ -266,6 +266,64 @@ def test_frozen_mlp_recomputes_gate_and_up(autocast):
         cls.forward = saved
 
 
+@pytest.mark.parametrize("x_dtype", [F32, F16])
+def test_nf4_mlp_fast_path_matches_the_original_bitwise(x_dtype):
+    """The 4-bit layout of the real run: bitsandbytes Linear4bit gate/up/down (fp16 compute),
+    fp32 MLP input, fp16 autocast. The fast path (one input cast, fp16 gate/up and gradients)
+    must equal the module-calling recompute path bit for bit, and the original forward to
+    rounding (silu itself differs from torch's in the last fp32 bit)."""
+    bnb = pytest.importorskip("bitsandbytes")
+    modeling = pytest.importorskip("transformers.models.qwen2.modeling_qwen2")
+    from solution import swiglu_recompute as mod
+
+    torch.manual_seed(0)
+    config = modeling.Qwen2Config(hidden_size=256, intermediate_size=704, hidden_act="silu")
+    mlp = modeling.Qwen2MLP(config)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        dense = getattr(mlp, name)
+        layer = bnb.nn.Linear4bit(dense.in_features, dense.out_features, bias=False,
+                                  compute_dtype=torch.float16, quant_type="nf4")
+        layer.weight = bnb.nn.Params4bit(dense.weight.data.half(), requires_grad=False,
+                                         quant_type="nf4")
+        setattr(mlp, name, layer)
+    mlp = mlp.cuda()
+    assert mod._nf4_pair(mlp.gate_proj, mlp.up_proj, torch.zeros(1, device="cuda")) is not None
+
+    cls = modeling.Qwen2MLP
+    saved = cls.forward
+    x = (torch.randn(3, 80, 256, device="cuda") * 2).to(x_dtype)
+    grad = torch.randn(3, 80, 256, device="cuda").to(x_dtype)
+    try:
+        x_ref = x.clone().requires_grad_()
+        with torch.autocast("cuda", dtype=F16):
+            out_ref = saved(mlp, x_ref)
+        out_ref.backward(grad)
+
+        mod.patch_qwen2_mlp_recompute()
+        x_new = x.clone().requires_grad_()
+        with torch.autocast("cuda", dtype=F16):
+            out = mlp(x_new)
+        out.backward(grad)
+
+        real_pair = mod._nf4_pair
+        mod._nf4_pair = lambda *a: None  # force the module-calling recompute path
+        try:
+            x_mod = x.clone().requires_grad_()
+            with torch.autocast("cuda", dtype=F16):
+                out_mod = mlp(x_mod)
+            out_mod.backward(grad)
+        finally:
+            mod._nf4_pair = real_pair
+
+        assert out.dtype == out_ref.dtype == out_mod.dtype == x_dtype
+        assert torch.equal(out, out_mod)
+        assert torch.equal(x_new.grad, x_mod.grad)
+        assert_close(out, out_ref, 2e-3)
+        assert_close(x_new.grad, x_ref.grad, 2e-3)
+    finally:
+        cls.forward = saved
+
+
 def test_patch_falls_back_for_cpu_and_other_activations():
     modeling = pytest.importorskip("transformers.models.qwen2.modeling_qwen2")
     from solution import swiglu_recompute as mod

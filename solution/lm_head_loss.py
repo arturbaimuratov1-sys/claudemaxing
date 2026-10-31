@@ -137,7 +137,9 @@ class _FusedHeadLoss(torch.autograd.Function):
         grad_raw = torch.empty(n, shape[-1], dtype=torch.float32, device=hidden.device) \
             if want_grad else None
         if chunk_rows is None:
-            chunk_rows = max(1, CHUNK_BYTES // (vocab * w.element_size()))
+            # A multiple of 16 rows keeps every slice below 16-byte aligned, so Triton compiles
+            # one variant of the kernel instead of one per alignment (compilation is timed).
+            chunk_rows = max(16, CHUNK_BYTES // (vocab * w.element_size()) // 16 * 16)
         for start in range(0, n, chunk_rows):
             stop = min(n, start + chunk_rows)
             logits = torch.mm(h2[start:stop].to(compute_dtype), w.t())

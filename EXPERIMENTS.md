@@ -17,3 +17,13 @@ Run 1 details (Kaggle T4, same session, base and solution once each):
 - own kernel time over timed steps (ms): silu_mul_bwd_recompute 1927.7, silu_mul_fwd_persistent 1139.0, qwen_rmsnorm_bwd_kernel 488.2, lm_head_xent_rows_kernel 361.1, qwen_rmsnorm_fwd_kernel 287.6 (timed loop 43.29 s).
 - profiler top (16 steps, 10.56 s GPU): fp16 GEMMs 20.1% + 15.0% + 7.7%; fp32<->fp16 copies 8.5% + 8.1%; NF4 dequant 5.3%; SDPA backward 5.2%.
 - tests_local on Kaggle: 103 passed, 2 failed — both `test_lm_head_trainer` variants: Kaggle exposes two T4s, so the test's Trainer wraps the model in DataParallel and the fused head's backward failed (`size of tensor a (864) must match ... b (2)`). The harness runs with `CUDA_VISIBLE_DEVICES=0`, so the measured runs were not affected; fixed in the next commit by falling back to TRL's path under DataParallel.
+
+| 2026-10-31 | 67d0625 | + MLP gate/up recomputed in backward, DataParallel fallback | T4, run 2 of 5, `--repeats 1 --profile` | 78.8 (base 75.7 in the same session) | 4803 (base 14345) | 2.04964 (base 2.04965, -0.000%) | 8.3% | 10/10 |
+
+Run 2 details:
+- base: wall 75.66 s, train loop 53.72 s; solution: wall 78.77 s, train loop 56.96 s, timed loop 51.00 s; speedup 0.961x, memory ratio 2.987x.
+- check 6: first step 0.01%, mean 0.01%; check 8: time x1.041, memory x0.335.
+- own kernel time (ms): silu_mul_bwd_recompute 1928.4, silu_mul_fwd_persistent 1138.6, qwen_rmsnorm_bwd 491.2, lm_head_xent_rows 367.9, qwen_rmsnorm_fwd 287.3.
+- profiler (16 steps): total GPU 12.55 s (run 1: 10.56 s); fp32<->fp16 copies 10.1% + 7.2% (1263 + 906 ms), NF4 dequant 728 ms (561 ms in run 1): the recompute costs GEMMs, dequantisation and dtype casts.
+- tests_local on Kaggle with CUDA_VISIBLE_DEVICES=0: 107/107.
+- The base wall time moved from 86.3 s (run 1) to 75.7 s (run 2) between sessions: wall-time ratios are noisy at this level.
