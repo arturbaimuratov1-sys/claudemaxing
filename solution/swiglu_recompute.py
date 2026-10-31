@@ -114,6 +114,59 @@ def swiglu_recompute(gate, up, inplace=False):
     return SwiGLURecompute.apply(gate, up, inplace)
 
 
+def _autocast_state():
+    try:
+        return torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
+    except (TypeError, AttributeError):  # torch < 2.4
+        return torch.is_autocast_enabled(), torch.get_autocast_gpu_dtype()
+
+
+class MLPInputRecompute(torch.autograd.Function):
+    """silu(gate_proj(x)) * up_proj(x) for frozen projections, keeping only `x` for backward.
+
+    In the 4-bit model the projections return the dtype of their input, and the input of the
+    MLP is fp32 (the final norm weights are fp32), so gate and up are two fp32 [tokens, 8960]
+    tensors per layer -- the largest thing the activation would otherwise keep. Backward runs
+    the two frozen projections again on the saved input (under the autocast state of the
+    forward, so the values are the same), takes the activation gradient with the recomputing
+    kernel written over the fresh gate/up buffers, and lets autograd carry it back to `x`."""
+
+    @staticmethod
+    def forward(ctx, x, gate_proj, up_proj):
+        gate, up = gate_proj(x), up_proj(x)
+        out = torch.empty(gate.shape, dtype=torch.promote_types(gate.dtype, up.dtype),
+                          device=gate.device)
+        n = gate.numel()
+        if n:
+            silu_mul_fwd_persistent[(_programs(n, gate.device),)](
+                gate.contiguous(), up.contiguous(), out, n, BLOCK=BLOCK, num_warps=WARPS)
+        ctx.save_for_backward(x)
+        ctx.projs = (gate_proj, up_proj)
+        ctx.autocast = _autocast_state()
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        (x,) = ctx.saved_tensors
+        gate_proj, up_proj = ctx.projs
+        enabled, dtype = ctx.autocast
+        with torch.enable_grad(), torch.autocast("cuda", dtype=dtype, enabled=enabled):
+            x_again = x.detach().requires_grad_(True)
+            gate, up = gate_proj(x_again), up_proj(x_again)
+        g, u = gate.detach(), up.detach()
+        n = g.numel()
+        if n:  # gradients written over the recomputed buffers, nothing else allocated
+            silu_mul_bwd_recompute[(_programs(n, g.device),)](
+                grad.contiguous(), g, u, g, u, n, BLOCK=BLOCK, WANT_DGATE=True, WANT_DUP=True,
+                num_warps=WARPS)
+        torch.autograd.backward((gate, up), (g, u), inputs=[x_again])
+        return x_again.grad, None, None
+
+
+def _frozen(module):
+    return not any(p.requires_grad for p in module.parameters())
+
+
 def patch_qwen2_mlp_recompute():
     """Send the activation of Qwen2MLP.forward through the recomputing kernel. Class-level,
     like the other patches: works before or after Soup builds the model. Anything the kernel
@@ -129,6 +182,9 @@ def patch_qwen2_mlp_recompute():
         act = getattr(getattr(self, "config", None), "hidden_act", "silu")
         if act != "silu" or not isinstance(x, torch.Tensor) or not x.is_cuda:
             return original(self, x)
+        if (x.dtype in _SUPPORTED and _frozen(self.gate_proj) and _frozen(self.up_proj)
+                and torch.is_grad_enabled() and x.requires_grad):
+            return self.down_proj(MLPInputRecompute.apply(x, self.gate_proj, self.up_proj))
         gate, up = self.gate_proj(x), self.up_proj(x)
         if (gate.shape != up.shape or gate.dtype not in _SUPPORTED
                 or up.dtype not in _SUPPORTED):

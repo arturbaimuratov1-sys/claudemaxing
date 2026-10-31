@@ -222,6 +222,50 @@ def test_patched_qwen2_mlp_matches_the_original():
         cls.forward = saved
 
 
+@pytest.mark.parametrize("autocast", [False, True])
+def test_frozen_mlp_recomputes_gate_and_up(autocast):
+    """With frozen projections (the 4-bit model) only the MLP input is kept for backward;
+    output and input gradient match the original forward under the same autocast state."""
+    modeling = pytest.importorskip("transformers.models.qwen2.modeling_qwen2")
+    from solution import swiglu_recompute as mod
+
+    cls = modeling.Qwen2MLP
+    saved = cls.forward
+    ctx = (lambda: torch.autocast("cuda", dtype=F16)) if autocast else \
+        (lambda: torch.autocast("cuda", enabled=False))
+    try:
+        mlp = _small_mlp(modeling)
+        if autocast:
+            mlp = mlp.float()
+        mlp.requires_grad_(False)
+        x_dtype = F32 if autocast else F16
+        x = (torch.randn(4, 96, 256, device="cuda") * 2).to(x_dtype)
+        grad = torch.randn(4, 96, 256, device="cuda")
+
+        x_ref = x.clone().requires_grad_()
+        with ctx():
+            out_ref = saved(mlp, x_ref)
+        out_ref.backward(grad.to(out_ref.dtype))
+
+        mod.patch_qwen2_mlp_recompute()
+        x_new = x.clone().requires_grad_()
+        with ctx():
+            out = mlp(x_new)
+        out.backward(grad.to(out.dtype))
+        assert out.dtype == out_ref.dtype
+        assert_close(out, out_ref, 2e-3)
+        assert_close(x_new.grad, x_ref.grad, 2e-3)
+
+        kept = []
+        x_hook = x.clone().requires_grad_()
+        with torch.autograd.graph.saved_tensors_hooks(
+                lambda t: (kept.append(t.data_ptr()), t)[1], lambda t: t), ctx():
+            mod.MLPInputRecompute.apply(x_hook, mlp.gate_proj, mlp.up_proj)
+        assert kept == [x_hook.data_ptr()]
+    finally:
+        cls.forward = saved
+
+
 def test_patch_falls_back_for_cpu_and_other_activations():
     modeling = pytest.importorskip("transformers.models.qwen2.modeling_qwen2")
     from solution import swiglu_recompute as mod

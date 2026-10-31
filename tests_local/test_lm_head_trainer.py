@@ -132,6 +132,9 @@ def test_training_matches_the_base_run(checkpoint, tmp_path, variant):
     """`head`: only the fused head patches; `apply`: the whole solution.apply()."""
     for name in ("peft", "trl", "bitsandbytes", "soup_cli", "datasets"):
         pytest.importorskip(name)
+    if torch.cuda.device_count() > 1:
+        pytest.skip("run with CUDA_VISIBLE_DEVICES=0, as the harness does: with several GPUs the "
+                    "Trainer uses DataParallel and the fused head falls back to TRL's path")
     from transformers.models.qwen2 import modeling_qwen2
     from trl.trainer import sft_trainer as trl_sft
 

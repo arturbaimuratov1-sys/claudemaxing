@@ -263,6 +263,8 @@ def _causal_lm(model):
 def _fused_target(trainer, model, inputs):
     """The causal LM to run with the fused head, or None to keep TRL's own path."""
     if (not isinstance(model, torch.nn.Module) or not getattr(trainer.model, "training", False)
+            or isinstance(model, torch.nn.DataParallel)  # one GPU only (the harness pins GPU 0)
+            or getattr(trainer.args, "n_gpu", 1) > 1
             or not isinstance(inputs, dict) or "labels" not in inputs
             or "shift_labels" in inputs
             or getattr(trainer.args, "use_liger_kernel", False)
