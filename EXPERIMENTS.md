@@ -36,3 +36,35 @@ Run 3 details:
 - own kernel time (ms): silu_mul_bwd_recompute 1135.5, silu_mul_fwd_persistent 785.3, qwen_rmsnorm_bwd 405.0, lm_head_xent_rows 345.0, qwen_rmsnorm_fwd 288.8 -> 6.2% (the SwiGLU kernels now read fp16 gate/up, so they take less time; the share dropped with them).
 - profiler (16 steps): total GPU 12.29 s.
 - tests_local on Kaggle with CUDA_VISIBLE_DEVICES=0: 109/109.
+
+| 2026-10-31 | fa1f25d | + fused head walks the vocabulary in chunks (no full fp16 head weight) | T4, run 4 of 5, `--repeats 1 --profile` | 75.2 (base 76.0 in the same session) | 4283 (base 14345) | 2.04966 (base 2.04967, -0.000%) | 6.8% | 10/10 |
+
+Run 4 details:
+- base: wall 76.01 s, train loop 54.0 s; solution: wall 75.15 s, train loop 52.99 s, timed loop 47.14 s; speedup 1.011x, memory ratio 3.349x.
+- check 6: first step 0.01%, mean 0.01%; check 8: time x0.989, memory x0.299.
+- own kernel time (ms): silu_mul_bwd_recompute 1135.1, silu_mul_fwd_persistent 785.5, lm_head_vocab_chunk 574.0, qwen_rmsnorm_bwd 404.5, qwen_rmsnorm_fwd 289.9 -> 6.8%.
+- profiler (16 steps): total GPU 11.51 s (run 3: 12.29 s).
+- check 3 notes that `lm_head_xent_rows_kernel` (the fallback path's kernel) did not run; it is only used when the model returns logits after all.
+- tests_local on Kaggle with CUDA_VISIBLE_DEVICES=0: 112/112.
+
+| 2026-10-31 | 572c891 | + fused RoPE (qwen_rope_kernel) | T4, run 5 of 5, `--repeats 1 --profile` | 74.0 (base 76.1 in the same session) | 4263 (base 14345) | 2.04970 (base 2.04965, +0.002%) | 7.7% | 10/10 |
+
+Run 5 details:
+- base: wall 76.06 s, train loop 53.89 s; solution: wall 74.05 s, train loop 51.94 s, timed loop 45.82 s; speedup 1.027x, memory ratio 3.365x.
+- check 6: first step 0.02%, mean 0.01%; check 8: time x0.974, memory x0.297.
+- own kernel time (ms): silu_mul_bwd_recompute 1135.6, silu_mul_fwd_persistent 786.1, lm_head_vocab_chunk 578.9, qwen_rmsnorm_bwd 404.6, qwen_rope 350.6, qwen_rmsnorm_fwd 290.9 -> 7.7%.
+- profiler (16 steps): total GPU 11.15 s (run 4: 11.51 s).
+- tests_local on Kaggle with CUDA_VISIBLE_DEVICES=0: 126/126.
+
+## Summary of the session (2026-10-31, Kaggle T4, `--repeats 1` each; base re-measured in every run)
+
+| version | commit | soup train, s (base) | peak MiB | eval loss (base) | own kernels | checks |
+|---|---|---|---|---|---|---|
+| safe-v1 | c2ec325 | ~80 (79-80) | 12383 | 2.04965 (2.04968) | >=5% | 10/10 |
+| + fused head | f386eca | 70.9 (86.3) | 8483 | 2.04963 (2.04967) | 9.7% | 10/10 |
+| + MLP recompute | 67d0625 | 78.8 (75.7) | 4803 | 2.04964 (2.04965) | 8.3% | 10/10 |
+| + NF4 fast path | fb7a219 | 75.4 (76.0) | 4803 | 2.04968 (2.04961) | 6.2% | 10/10 |
+| + vocab-chunked head | fa1f25d | 75.2 (76.0) | 4283 | 2.04966 (2.04967) | 6.8% | 10/10 |
+| + fused RoPE | 572c891 | 74.0 (76.1) | 4263 | 2.04970 (2.04965) | 7.7% | 10/10 |
+
+Wall times move by ~10 s between sessions (base: 75.7-86.3 s), so compare each version with the base of the same run.
