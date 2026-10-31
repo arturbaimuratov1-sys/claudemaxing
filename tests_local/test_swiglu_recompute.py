@@ -315,8 +315,11 @@ def test_nf4_mlp_fast_path_matches_the_original_bitwise(x_dtype):
         finally:
             mod._nf4_pair = real_pair
 
-        assert out.dtype == out_ref.dtype == out_mod.dtype == x_dtype
-        assert torch.equal(out, out_mod)
+        assert out_ref.dtype == out_mod.dtype == x_dtype
+        # the fast path hands the 4-bit down_proj its fp16 input directly, so the MLP output is
+        # fp16: the same numbers the reference returns after its fp16 matmul and upcast
+        assert out.dtype == F16
+        assert torch.equal(out.to(x_dtype), out_mod)
         assert torch.equal(x_new.grad, x_mod.grad)
         assert_close(out, out_ref, 2e-3)
         assert_close(x_new.grad, x_ref.grad, 2e-3)

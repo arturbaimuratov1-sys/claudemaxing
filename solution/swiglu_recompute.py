@@ -151,7 +151,7 @@ class MLPInputRecompute(torch.autograd.Function):
     branch's input gradient is cast to the dtype of `x` and added, as the reference does."""
 
     @staticmethod
-    def forward(ctx, x, gate_proj, up_proj):
+    def forward(ctx, x, gate_proj, up_proj, down_compute=None):
         nf4 = _nf4_pair(gate_proj, up_proj, x)
         if nf4 is not None:
             import bitsandbytes as bnb
@@ -161,6 +161,10 @@ class MLPInputRecompute(torch.autograd.Function):
             gate = bnb.matmul_4bit(x_low, wg, quant_state=qg)
             up = bnb.matmul_4bit(x_low, wu, quant_state=qu)
             out_dtype, round_silu = x.dtype, x.dtype == compute
+            if down_compute == compute:
+                # The next layer is a 4-bit down_proj that casts its input to `compute` first:
+                # write that cast directly (one rounding of the same fp32 product).
+                out_dtype = compute
         else:
             gate, up = gate_proj(x), up_proj(x)
             out_dtype, round_silu = torch.promote_types(gate.dtype, up.dtype), True
@@ -202,9 +206,9 @@ class MLPInputRecompute(torch.autograd.Function):
         if ctx.nf4 is not None:
             (dx_gate,) = torch.autograd.grad(gate, x_again, g)
             (dx_up,) = torch.autograd.grad(up, x_again, u)
-            return dx_gate.to(ctx.x_dtype) + dx_up.to(ctx.x_dtype), None, None
+            return dx_gate.to(ctx.x_dtype) + dx_up.to(ctx.x_dtype), None, None, None
         torch.autograd.backward((gate, up), (g, u), inputs=[x_again])
-        return x_again.grad, None, None
+        return x_again.grad, None, None, None
 
 
 def _nf4_layer(linear):
@@ -256,7 +260,9 @@ def patch_qwen2_mlp_recompute():
             return original(self, x)
         if (x.dtype in _SUPPORTED and _frozen(self.gate_proj) and _frozen(self.up_proj)
                 and torch.is_grad_enabled() and x.requires_grad):
-            return self.down_proj(MLPInputRecompute.apply(x, self.gate_proj, self.up_proj))
+            down = _nf4_layer(self.down_proj)
+            return self.down_proj(MLPInputRecompute.apply(x, self.gate_proj, self.up_proj,
+                                                          down[1] if down else None))
         gate, up = self.gate_proj(x), self.up_proj(x)
         if (gate.shape != up.shape or gate.dtype not in _SUPPORTED
                 or up.dtype not in _SUPPORTED):
