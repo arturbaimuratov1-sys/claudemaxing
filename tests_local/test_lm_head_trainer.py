@@ -145,6 +145,7 @@ def test_training_matches_the_base_run(checkpoint, tmp_path, variant):
 
     saved = [(modeling_qwen2.Qwen2ForCausalLM, "forward"), (trl_sft.SFTTrainer, "compute_loss"),
              (modeling_qwen2.Qwen2MLP, "forward"), (modeling_qwen2.Qwen2RMSNorm, "forward")]
+    saved.append((modeling_qwen2, "apply_rotary_pos_emb"))
     saved = [(cls, name, getattr(cls, name)) for cls, name in saved]
     calls = []
     real = mod.fused_head_loss

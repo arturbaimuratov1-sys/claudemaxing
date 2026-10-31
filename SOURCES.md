@@ -67,3 +67,14 @@ copied.
   fp32), transformers 5.16.1 `loss/loss_utils.py` (`ForCausalLMLoss`, `fixed_cross_entropy`),
   TRL 0.29.1 `trainer/sft_trainer.py` lines 1200-1328 (entropy, num_tokens, token accuracy),
   soup-cli 0.77.0 `trainer/rewind_hf.py` (per-row losses).
+
+## solution/rope.py
+
+- **Reference behaviour**: `apply_rotary_pos_emb` and `rotate_half` in transformers 5.16.1,
+  `transformers/models/qwen2/modeling_qwen2.py` lines 105-135, called by name from
+  `Qwen2Attention.forward`. Read to reproduce the formula, the layout (q/k transposed views,
+  cos/sin of batch 1) and the dtype.
+- **Rotary position embedding** itself: Su et al., "RoFormer: Enhanced Transformer with Rotary
+  Position Embedding", https://arxiv.org/abs/2104.09864 (formula only). The backward as the
+  transposed rotation is derived by hand. Fusing RoPE into one elementwise kernel is a common
+  idea; no implementation was looked at or copied.

@@ -15,6 +15,7 @@ The rules in short (the README and the task statement have the full ones):
 
 from .lm_head_loss import patch_fused_head_loss
 from .rmsnorm import patch_qwen2_rmsnorm
+from .rope import patch_qwen2_rope
 from .swiglu_recompute import patch_qwen2_mlp_recompute
 
 
@@ -22,3 +23,4 @@ def apply():
     patch_qwen2_mlp_recompute()  # SwiGLU with recomputation (solution/swiglu_recompute.py)
     patch_qwen2_rmsnorm()  # our fused RMSNorm (solution/rmsnorm.py)
     patch_fused_head_loss()  # head + loss + metrics without full logits (solution/lm_head_loss.py)
+    patch_qwen2_rope()  # rotary embedding in one pass (solution/rope.py)

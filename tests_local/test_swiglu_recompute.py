@@ -365,9 +365,11 @@ def test_apply_uses_the_new_mlp_patch_not_the_example():
 
     mlp_saved = modeling.Qwen2MLP.forward
     norm_saved = modeling.Qwen2RMSNorm.forward
+    rope_saved = modeling.apply_rotary_pos_emb
     try:
         solution.apply()
         assert getattr(modeling.Qwen2MLP.forward, "_swiglu_recompute", False)
     finally:
         modeling.Qwen2MLP.forward = mlp_saved
         modeling.Qwen2RMSNorm.forward = norm_saved
+        modeling.apply_rotary_pos_emb = rope_saved
