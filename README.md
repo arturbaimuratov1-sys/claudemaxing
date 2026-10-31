@@ -5,14 +5,14 @@ on q/v, batch 4, up to 512 tokens, 64 steps) on a free Kaggle T4 through one fun
 `solution.apply()`. The training task, Soup's settings and Soup's outputs stay the same; the run
 needs **5x less GPU memory** than the base and is not slower.
 
-## Results (Kaggle T4, the submission notebook below, commit 947705c)
+## Results (Kaggle T4, the submission notebook below, commit 873043d)
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 80.4 | 77.9 | speedup 1.033x |
-| Peak GPU memory (nvidia-smi), MiB | 14345 | 2839 | base/ours 5.053x |
-| Eval loss (public rows) | 2.04969 | 2.04971 | +0.001% |
-| Own kernels, share of training time | — | 14.4% | rule: >= 5% |
+| Time of `soup train`, s | 85.6 | 69.4 | speedup 1.233x |
+| Peak GPU memory (nvidia-smi), MiB | 14345 | 2755 | base/ours 5.207x |
+| Eval loss (public rows) | | | -0.008% |
+| Own kernels, share of training time | — | 15.3% | rule: >= 5% |
 
 An earlier measurement of the same code (3e1da26 in [EXPERIMENTS.md](EXPERIMENTS.md)): 77.1 s
 against 78.3 s, 2839 MiB, eval loss +0.000%, own kernels 15.0% (11.5% without the SwiGLU pair).
@@ -37,6 +37,7 @@ copies. Where the memory went and what replaced it:
 | bitsandbytes NF4 dequantization | Own dequant kernel, nested absmax fused in the same pass, bit-identical to bitsandbytes | `nf4_dequant_kernel` — `solution/nf4.py` |
 | LoRA dropout keeps the dropped fp32 input | The dropout mask from `torch.native_dropout` (same RNG, same distribution) is packed into bits; backward rebuilds the dropped input | `lora_dropout_pack_kernel`, `lora_dropout_unpack_kernel` — `solution/lora.py` |
 | Tied embedding upcast to fp32 (890 MiB) | Stored in fp16 (every value is an exact fp16 number, checked), embedding output cast to fp32 — same values | `solution/embedding.py` |
+| Pad tokens: every token-wise op (projections, MLP, norms, LoRA, head) runs on [B, T] including padding | The real tokens of the batch run as one row [1, N] with their own position ids and a mask that keeps attention inside each row exactly as the base mask; per-token outputs go back to [B, T]. Same rows, same batches (removing pad tokens inside a batch is allowed) | `solution/lm_head_loss.py` (`_pack_batch`) |
 | SDPA with k/v expanded by `repeat_kv` | torch SDPA per kv head with stride-0 k/v views (same products, no copies) | `solution/attention.py` |
 
 Every kernel was tested against the torch reference in fp16 (values and gradients) in
@@ -47,8 +48,8 @@ Every kernel was tested against the torch reference in fp16 (values and gradient
 ## How to run
 
 Kaggle notebook (template `templates/kaggle_notebook.ipynb`, `COMMIT` =
-`947705c5abc2e8a6c1d181214d0674e9df0136be`):
-https://www.kaggle.com/code/togamyssovabilkaiyr/soup-kernel-challenge-claudemaxing
+`873043d747dbcdadb0b7b0d933c44456d57176c5`):
+https://www.kaggle.com/code/togamyssovabilkaiyr/notebook9b2547a27b
 
 1. Open the public Kaggle notebook above, settings
    **GPU T4 x2**, **Internet on**, and **Run All**. It clones this repository at `COMMIT`,

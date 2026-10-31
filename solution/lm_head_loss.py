@@ -254,12 +254,16 @@ class _FusedHeadLoss(torch.autograd.Function):
         return grad, None, None, None, None, None, None
 
 
-def fused_head_loss(hidden, weight, labels, num_items_in_batch=None, chunk_cols=None):
+def fused_head_loss(hidden, weight, labels, num_items_in_batch=None, chunk_cols=None,
+                    target=None):
     """ForCausalLMLoss(linear(hidden, weight), labels) and the per-token terms the trainer's
     metrics need, without materialising the logits. `weight` must be frozen: the gradient
     goes to `hidden` only. Returns (loss, step) with step.token_loss and step.token_entropy of
-    shape [batch, seq] (fp32), step.correct and step.labelled (counts)."""
-    target = shift_labels_left(labels).to(hidden.device)
+    shape [batch, seq] (fp32), step.correct and step.labelled (counts). `target` (the labels
+    already shifted, same leading shape as `hidden`) replaces `labels` when given."""
+    if target is None:
+        target = shift_labels_left(labels)
+    target = target.to(hidden.device)
     labelled = (target != IGNORE_INDEX).sum()
     if num_items_in_batch is None:
         denominator = labelled
@@ -293,6 +297,72 @@ def head_metrics_from_logits(logits, labels):
                            correct=correct.sum(), labelled=(target != IGNORE_INDEX).sum())
 
 
+def _pack_batch(lm, kwargs, labels):
+    """The real (non-pad) tokens of a padded batch, or None to run the batch as it is.
+
+    Only token-wise work depends on the number of tokens, so the decoder runs on the real tokens
+    of the batch laid out as one row [1, N]. Each token keeps its own position id (its column,
+    or the batch's position_ids), and a [1, 1, N, N] boolean mask lets a token attend exactly
+    the keys the base mask allows: real tokens of the same row at a column not after its own.
+    The batch keeps its rows; nothing is mixed between batches."""
+    ids, mask = kwargs.get("input_ids"), kwargs.get("attention_mask")
+    head = lm.lm_head
+    if (not isinstance(ids, torch.Tensor) or ids.dim() != 2 or not ids.is_cuda
+            or not isinstance(mask, torch.Tensor) or mask.shape != ids.shape
+            or kwargs.get("inputs_embeds") is not None or kwargs.get("past_key_values") is not None
+            or labels.shape != ids.shape
+            or type(head) is not torch.nn.Linear or head.bias is not None
+            or head.weight.requires_grad
+            or getattr(lm.config, "_attn_implementation", None) != "sdpa"
+            or getattr(lm.config, "use_sliding_window", False)):
+        return None
+    B, T = ids.shape
+    keep = mask.reshape(-1) != 0
+    index = keep.nonzero().squeeze(1)
+    n = index.numel()
+    if n == 0 or n == B * T:
+        return None
+    pos = kwargs.get("position_ids")
+    if isinstance(pos, torch.Tensor) and pos.shape == ids.shape:
+        pos = pos.reshape(-1)[index]
+    elif pos is None:
+        pos = index % T
+    else:
+        return None
+    row, col = index // T, index % T
+    allowed = (row[:, None] == row[None, :]) & (col[None, :] <= col[:, None])
+    target = shift_labels_left(labels.to(ids.device)).reshape(-1)[index]
+    return SimpleNamespace(B=B, T=T, index=index, ids=ids.reshape(-1)[index][None],
+                           pos=pos[None], mask=allowed[None, None], target=target[None])
+
+
+def _packed_forward(lm, kwargs, packed):
+    """The fused training forward on the packed real tokens; the per-token terms go back to
+    their [batch, seq] places (zeros at pads, which every consumer masks out)."""
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+
+    rest = {k: v for k, v in kwargs.items()
+            if k not in ("input_ids", "attention_mask", "position_ids")}
+    outputs = lm.model(input_ids=packed.ids, attention_mask=packed.mask,
+                       position_ids=packed.pos, **rest)
+    hidden = outputs.last_hidden_state
+    loss, step = fused_head_loss(hidden, lm.lm_head.weight, None,
+                                 num_items_in_batch=kwargs.get("num_items_in_batch"),
+                                 target=packed.target)
+    full = packed.B * packed.T
+
+    def spread(values):
+        out = torch.zeros(full, dtype=values.dtype, device=values.device)
+        out[packed.index] = values.reshape(-1)
+        return out.view(packed.B, packed.T)
+
+    step = SimpleNamespace(token_loss=spread(step.token_loss),
+                           token_entropy=spread(step.token_entropy),
+                           correct=step.correct, labelled=step.labelled)
+    lm.__dict__[_STEP_ATTR] = step
+    return CausalLMOutputWithPast(loss=loss, logits=None)
+
+
 def patch_qwen2_causal_lm_head():
     """Qwen2ForCausalLM.forward: when the trainer has asked for it (and only then), build the
     loss from the hidden states with the fused head and return no logits."""
@@ -316,6 +386,9 @@ def patch_qwen2_causal_lm_head():
         kwargs.pop("labels")
         kwargs.pop("logits_to_keep", None)
         shrink_tied_embedding(self)  # fp16 storage of the tied weight, lossless (embedding.py)
+        packed = _pack_batch(self, kwargs, labels)
+        if packed is not None:
+            return _packed_forward(self, kwargs, packed)
         outputs = self.model(**kwargs)
         hidden = outputs.last_hidden_state
         head = self.lm_head

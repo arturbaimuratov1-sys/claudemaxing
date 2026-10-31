@@ -1,10 +1,10 @@
 # Submission: claudemaxing
 
 ## Links
-- Repository, final commit: https://github.com/arturbaimuratov1-sys/claudemaxing/commit/947705c5abc2e8a6c1d181214d0674e9df0136be
+- Repository, final commit: https://github.com/arturbaimuratov1-sys/claudemaxing/commit/873043d747dbcdadb0b7b0d933c44456d57176c5
   (later commits only add these links to README.md and SUBMISSION.md; `solution/` is the same)
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
-  the README): https://www.kaggle.com/code/togamyssovabilkaiyr/soup-kernel-challenge-claudemaxing
+  the README): https://www.kaggle.com/code/togamyssovabilkaiyr/notebook9b2547a27b
 - Demo video (up to 3 minutes): <link>
 - Presentation: <link>
 
@@ -29,18 +29,18 @@ Ideas taken from other work, with links (we wrote the code ourselves): see [SOUR
 tutorials read for patterns only; reference behaviour read in transformers, peft, TRL, Soup and
 bitsandbytes).
 
-## Results on Kaggle T4 (the notebook above, version 1, commit 947705c)
+## Results on Kaggle T4 (the notebook above, version 1, commit 873043d)
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 80.4 | 77.9 | speedup 1.033x |
-| Peak GPU memory, MiB | 14345 | 2839 | base/ours 5.053x |
-| Eval loss (public rows) | 2.04969 | 2.04971 | +0.001% |
+| Time of `soup train`, s | 85.6 | 69.4 | speedup 1.233x |
+| Peak GPU memory, MiB | 14345 | 2755 | base/ours 5.207x |
+| Eval loss (public rows) | | | -0.008% |
 
-- [x] All 10 checks of `harness/check_rules.py` passed (own kernels 14.4% of the training time;
-  loss curve: first step 0.02%, mean 0.01%; 79/79 Soup tests)
+- [x] All 10 checks of `harness/check_rules.py` passed (own kernels 15.3% of the training time;
+  loss curve within the limits; 79/79 Soup tests)
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits
 
 ## Limitations
 See the README: own flash-attention is too slow on the T4 with Triton 3.6 (no tensor cores for
 `tl.dot` on sm75), so torch SDPA stays; the wall time is dominated by fixed start-up and Triton
-JIT; pad-free computation and an int8 embedding are the next steps.
+JIT; an int8 embedding and per-row attention for the packed tokens are the next steps.
