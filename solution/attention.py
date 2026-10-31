@@ -1,20 +1,17 @@
-"""Causal attention of Qwen2 (grouped-query, right padding) in Triton, fp16 tiles, fp32 sums.
+"""Attention of Qwen2 (grouped-query, right padding): what apply() uses, and an experiment.
 
-Why: on a T4 the base run hands SDPA fp32 q/k/v (the 4-bit projections return the dtype of
-their fp32 input), expands k/v to all query heads (repeat_kv, because a padding mask is
-passed), and the fp32 kernel keeps all of that for backward: about 43 KB per token per layer,
-the largest item of the activation memory. Here:
+Used: `patch_qwen2_grouped_sdpa`. transformers' sdpa path expands k/v to all query heads
+(repeat_kv: two full copies, because a padding mask is passed) and calls torch SDPA once. Here
+torch SDPA runs once per kv head, its query heads against k/v expanded as stride-0 views: the
+same kernel and the same output values, without the copies (3.8x faster on the T4 bench,
+bench_sdpa.py; slightly less memory kept for backward).
 
-* k/v are never expanded: a query head h reads kv head h // group.
-* q/k/v are rounded to fp16 once (the o_proj after attention rounds the output to fp16 anyway);
-  products are summed in fp32 (tl.dot), softmax runs in fp32 with exp2.
-* Backward keeps fp16 q, k, v, the fp16 output and one fp32 log-sum-exp per row: about 7 KB per
-  token per layer. The probabilities are recomputed from q, k and the log-sum-exp.
-* The output is fp16 under fp16 autocast. The base output is fp32, but its only consumer is
-  o_proj, which casts it to fp16 first, so o_proj sees the same values; its gradient arrives
-  in fp16, as the base's does before the cast.
-* The mask must be "causal and key is not padding" (what transformers builds for right padded
-  batches); anything else goes to the original SDPA path.
+Not used (kept as a record): `QwenAttention`, a causal GQA attention in Triton with fp16 tiles
+and fp32 sums, k/v never expanded, backward keeping fp16 q/k/v/out and one log-sum-exp per row
+(~7 KB per token and layer against ~13 KB for torch's fp16 SDPA). Correct (tests_local) and fast
+on an RTX 4060, but Triton 3.6 compiles its tl.dot to FMA instructions on the T4 (no mma), which
+made it 15x slower than torch there (EXPERIMENTS.md, run 1). Its mask must be "causal and key
+is not padding" (what transformers builds for right padded batches).
 """
 
 import weakref
