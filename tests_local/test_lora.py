@@ -54,6 +54,7 @@ def model_pair():
         m.weight = bnb.nn.Params4bit((torch.randn(m.out_features, m.in_features) * 0.05).half(),
                                      requires_grad=False, quant_type="nf4")
     block = block.cuda()
+    block.is_loaded_in_4bit = True  # as transformers marks it: peft then builds lora.bnb.Linear4bit
     model = get_peft_model(block, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
                                              target_modules=["q_proj", "v_proj"]))
     for n, p in model.named_parameters():
@@ -146,3 +147,4 @@ def test_non_contiguous_input_falls_back():
     finally:
         L.LoRABranch.forward = staticmethod(real)
     assert not calls and getattr(lora_layer.Linear.forward, "_lora_branch", False)
+    assert type(model.base_model.model.q_proj).__module__.endswith("lora.bnb")
