@@ -170,7 +170,9 @@ class MLPInputRecompute(torch.autograd.Function):
             silu_mul_fwd_persistent[(_programs(n, gate.device),)](
                 gate.contiguous(), up.contiguous(), out, n, BLOCK=BLOCK, ROUND_SILU=round_silu,
                 num_warps=WARPS)
-        ctx.save_for_backward(x)
+        # 4-bit path: only the fp16 copy of x enters the projections, so keep that, not x.
+        ctx.save_for_backward(x_low if nf4 is not None else x)
+        ctx.x_dtype = x.dtype
         ctx.projs, ctx.nf4, ctx.round_silu = (gate_proj, up_proj), nf4, round_silu
         ctx.autocast = _autocast_state()
         return out
@@ -184,7 +186,7 @@ class MLPInputRecompute(torch.autograd.Function):
                 import bitsandbytes as bnb
 
                 (wg, qg), (wu, qu), compute = ctx.nf4
-                x_again = x.detach().to(compute).requires_grad_(True)
+                x_again = x.detach().requires_grad_(True)  # already the fp16 copy
                 gate = bnb.matmul_4bit(x_again, wg, quant_state=qg)
                 up = bnb.matmul_4bit(x_again, wu, quant_state=qu)
             else:
@@ -200,7 +202,7 @@ class MLPInputRecompute(torch.autograd.Function):
         if ctx.nf4 is not None:
             (dx_gate,) = torch.autograd.grad(gate, x_again, g)
             (dx_up,) = torch.autograd.grad(up, x_again, u)
-            return dx_gate.to(x.dtype) + dx_up.to(x.dtype), None, None
+            return dx_gate.to(ctx.x_dtype) + dx_up.to(ctx.x_dtype), None, None
         torch.autograd.backward((gate, up), (g, u), inputs=[x_again])
         return x_again.grad, None, None
 

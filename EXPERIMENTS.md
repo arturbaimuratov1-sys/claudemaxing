@@ -68,3 +68,27 @@ Run 5 details:
 | + fused RoPE | 572c891 | 74.0 (76.1) | 4263 | 2.04970 (2.04965) | 7.7% | 10/10 |
 
 Wall times move by ~10 s between sessions (base: 75.7-86.3 s), so compare each version with the base of the same run.
+
+## Session 2026-10-31 evening: memory 2300 MiB / time 40 s attempt
+
+### Step 0 (no code changes)
+
+Own kernel share of 572c891 (run 5) without the two SwiGLU kernels (silu_mul_fwd_persistent,
+silu_mul_bwd_recompute): (578.9 + 404.6 + 350.6 + 290.9) ms / 45.82 s = **3.5%** (7.7% with
+them). Under 5%, so a kernel that is clearly ours is needed: the attention kernels below.
+
+Memory balance of 572c891 (peak 4263 MiB, nvidia-smi). Fixed parts measured locally on a
+random-weight model with the real Qwen2.5-1.5B shapes (4 and 28 layers scale linearly),
+activations per token and layer from `saved_tensors_hooks` with 4 x 512 tokens:
+
+| item | MiB at the peak | how known |
+|---|---|---|
+| CUDA context, non-torch | ~140 | run 1: nvidia-smi 8483 vs reserved 8340 |
+| NF4 weights + quant states, 28 layers | ~645 | local: 22.3 MiB per layer + absmax |
+| tied embedding / head, fp32 | 890 | 151936 x 1536 x 4 B |
+| LoRA params + grads + Adam (q/v, r=16, 2.2 M) | ~35 | 2.2 M x 16 B |
+| activations kept for backward | ~2550 | rest; 70.1 KB/token/layer x 28 layers -> ~1300 tokens in the largest batch |
+
+Activations kept per token and layer (572c891): SDPA in fp32 (q/k/v come out of the 4-bit
+projections in fp32, k/v expanded to 12 heads) 43.0 KB; RMSNorm inputs (fp32) 12.3 KB; LoRA A
+inputs (fp16) 6.3 KB; MLP input (fp32) 6.1 KB; dropout masks 2.3 KB.

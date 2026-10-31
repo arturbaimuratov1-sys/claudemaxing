@@ -78,3 +78,28 @@ copied.
   Position Embedding", https://arxiv.org/abs/2104.09864 (formula only). The backward as the
   transposed rotation is derived by hand. Fusing RoPE into one elementwise kernel is a common
   idea; no implementation was looked at or copied.
+
+## solution/attention.py
+
+- **Reference behaviour**: `sdpa_attention_forward` and `repeat_kv` in transformers 5.16.1,
+  `transformers/integrations/sdpa_attention.py`, and `Qwen2Attention.forward` in
+  `transformers/models/qwen2/modeling_qwen2.py` (lines 195-235). Read to learn the call
+  signature, the layouts (q/k/v as transposed views, output [B, T, H, D]), the mask
+  transformers passes for padded batches and that the base expands k/v when a mask is given.
+- **Tiled attention with an online softmax and recomputation in backward** (FlashAttention):
+  Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness",
+  https://arxiv.org/abs/2205.14135, and Dao, "FlashAttention-2",
+  https://arxiv.org/abs/2307.08691 (the algorithm from the papers, recalled from memory; the
+  flash-attn library is banned and was neither installed nor read). The Triton "Fused
+  Attention" tutorial (https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html)
+  is a known implementation of the same idea; it was not opened in this work and no code was
+  taken from it. Our version: grouped-query heads read in place (no k/v expansion), a key
+  padding vector instead of a full mask, backward split into a dk/dv kernel that loops over the
+  query heads of a group and a separate dq kernel (no atomics), fixed block sizes for the T4.
+- **Online softmax**: Milakov and Gimelshein, https://arxiv.org/abs/1805.02867 (as above).
+
+## solution/embedding.py
+
+- Our own observation from reading `peft.prepare_model_for_kbit_training` (peft 0.20.0,
+  `peft/utils/other.py`), which upcasts the non-quantized parameters to fp32: the embedding is
+  loaded in fp16, so its fp32 copy holds fp16 numbers only. No external code involved.
