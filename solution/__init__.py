@@ -13,6 +13,7 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+from .attention import patch_qwen2_grouped_sdpa
 from .lm_head_loss import patch_fused_head_loss
 from .lora import patch_peft_lora_4bit
 from .nf4 import patch_bnb_nf4_dequant
@@ -28,5 +29,6 @@ def apply():
     patch_qwen2_rope()  # rotary embedding in one pass (solution/rope.py)
     patch_bnb_nf4_dequant()  # NF4 weight dequantization in one kernel (solution/nf4.py)
     patch_peft_lora_4bit()  # LoRA branch with a packed dropout mask (solution/lora.py)
-    # solution/attention.py (patch_qwen2_attention) is not applied: Triton 3.6 compiles its
+    patch_qwen2_grouped_sdpa()  # torch SDPA per kv head, no k/v copies (solution/attention.py)
+    # Our own attention kernel (patch_qwen2_attention) is not applied: Triton 3.6 compiles its
     # tl.dot to FMA on the T4 (no mma), 40 ms per layer against 2.6 ms for torch's fp16 SDPA.
