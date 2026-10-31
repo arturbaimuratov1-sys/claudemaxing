@@ -14,6 +14,7 @@ The rules in short (the README and the task statement have the full ones):
 """
 
 from .lm_head_loss import patch_fused_head_loss
+from .lora import patch_peft_lora_4bit
 from .nf4 import patch_bnb_nf4_dequant
 from .rmsnorm import patch_qwen2_rmsnorm
 from .rope import patch_qwen2_rope
@@ -26,5 +27,6 @@ def apply():
     patch_fused_head_loss()  # head + loss + metrics without full logits (solution/lm_head_loss.py)
     patch_qwen2_rope()  # rotary embedding in one pass (solution/rope.py)
     patch_bnb_nf4_dequant()  # NF4 weight dequantization in one kernel (solution/nf4.py)
+    patch_peft_lora_4bit()  # LoRA branch with a packed dropout mask (solution/lora.py)
     # solution/attention.py (patch_qwen2_attention) is not applied: Triton 3.6 compiles its
     # tl.dot to FMA on the T4 (no mma), 40 ms per layer against 2.6 ms for torch's fp16 SDPA.
