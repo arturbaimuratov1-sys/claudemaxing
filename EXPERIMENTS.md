@@ -146,3 +146,46 @@ inputs (fp16) 6.3 KB; MLP input (fp32) 6.1 KB; dropout masks 2.3 KB.
 - tests_local on Kaggle: 2 LoRA tests failed with an ImportError from peft's torchao dispatch
   (their toy model was not marked 4-bit, so peft looked further than bitsandbytes); fixed in the
   tests (856ac36), the run itself uses peft's bitsandbytes LoRA layer.
+
+### Run 4 of 5: 2159f8b (+ RMSNorm keeps the fp16 copy of its output, shared with the q/v LoRA and MLP inputs)
+
+| commit | soup train, s (base same run) | peak MiB (nvidia-smi) | torch alloc / reserved | eval loss vs base | own kernels (w/o SwiGLU) | checks |
+|---|---|---|---|---|---|---|
+| 2159f8b | 77.2 (78.3), s = 1.014 | **2837** | 2446 / 2694 | +0.002% | 14.8% (11.4%) | 10/10 |
+
+- check 6: first step 0.02%, mean 0.01%; check 8: time x0.986, memory x0.198.
+- timed loop 44.04 s, median step 0.722 s (base 0.860).
+- Review afterwards: backward recovers n = y16 / w; for |w| ~ 1e-5 the absolute fp16 floor
+  divided by w gives up to ~1e-2 relative error in those channels. normcheck.py on the cached
+  Qwen2.5-1.5B: 35 of 57 norms have |w| < 2^-10 (min 6.5e-6), at most 17 such columns per norm.
+  Fixed in 3e1da26: those columns keep their fp16 normalised value in a small side buffer.
+
+### Run 5 of 5: 3e1da26 (RMSNorm side buffer for tiny-|w| columns; the recommended version)
+
+| commit | soup train, s (base same run) | peak MiB (nvidia-smi) | torch alloc / reserved | eval loss vs base | own kernels (w/o SwiGLU) | checks |
+|---|---|---|---|---|---|---|
+| 3e1da26 | 77.1 (78.3), s = 1.016 | **2839** | 2447 / 2696 | +0.000% | 15.0% (11.5%) | **10/10** |
+
+- check 6: first step 0.02%, mean 0.01%; check 8: time x0.984, memory x0.198.
+- timed loop 44.07 s, median step 0.721 s (base 51.84 s / 0.857 s); first two steps ~8.7 s
+  (Triton JIT of 10 kernel variants, fresh cache per run) against ~2.4 s for the base.
+- own kernel ms: nf4_dequant 2667, silu_mul_bwd_recompute 965, lm_head_vocab_chunk 583,
+  silu_mul_fwd_persistent 564, qwen_rmsnorm_fwd 439, qwen_rope 377, qwen_rmsnorm_bwd 373,
+  lora_dropout_unpack 365, lora_dropout_pack 266.
+- Reviews of the last commit: no blocking issue; open nits: dead `_NO_ZEROS`, a `w == 0` guard
+  in `w_safe` against weights changed without a version bump, `_SMALL` could be a weak dict.
+
+## Summary of the evening session (Kaggle T4, `--repeats 1 --profile`, base re-measured each run)
+
+| version | commit | soup train, s (base) | s | peak MiB | eval loss vs base | own kernels (w/o SwiGLU) | checks |
+|---|---|---|---|---|---|---|---|
+| start of the session | 572c891 | 74.0 (76.1) | 1.027 | 4263 | +0.002% | 7.7% (3.5%) | 10/10 |
+| own Triton attention | 0727b36 | 160.4 (87.2) | 0.543 | 3933 | -0.002% | 70.5% (68.8%) | 9/10 (time) |
+| fp16 embedding, MLP fp16 in/out, RMSNorm fp16 | ac0ce46 | 74.1 (78.0) | 1.053 | 3303 | -0.002% | 7.1% (3.75%) | 10/10 |
+| + NF4 kernel, LoRA bit mask, grouped SDPA | 8f6a67f | 76.8 (78.4) | 1.022 | 3157 | +0.001% | 14.7% (11.3%) | 10/10 |
+| + shared fp16 norm output | 2159f8b | 77.2 (78.3) | 1.014 | 2837 | +0.002% | 14.8% (11.4%) | 10/10 |
+| + tiny-|w| side buffer | **3e1da26** | 77.1 (78.3) | 1.016 | **2839** | +0.000% | **15.0% (11.5%)** | **10/10** |
+
+Targets: 2300 MiB and 40 s were not reached. Peak 4263 -> 2839 MiB (-33%); steady-state step
+-16% vs the base (0.721 vs 0.857 s), wall time -1.6% only, because of ~6 s of Triton JIT in the
+first steps and ~24 s of fixed start-up/loading.
