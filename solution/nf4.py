@@ -7,7 +7,10 @@ up and multiplied by its block's absmax. This kernel does both in one pass over 
 weight, with the same fp32 operations in the same order (fp contraction off, so no fused
 multiply-add changes a rounding), and writes the fp16 weight: bit-identical to bitsandbytes.
 
-Layout (bitsandbytes 0.50): byte i holds elements 2i (high nibble) and 2i+1 (low nibble);
+The layout and the arithmetic were read from bitsandbytes 0.50.2 (functional.dequantize_4bit,
+backends/cuda/ops.py; bitsandbytes also ships a Triton backend with a 4-bit dequant kernel of the
+same byte -> two lookups shape, which we did not copy; ours fuses the nested absmax).
+Layout: byte i holds elements 2i (high nibble) and 2i+1 (low nibble);
 element j belongs to absmax block j // blocksize; with double quantization that block's absmax
 is code2[absmax8[b]] * absmax2[b // blocksize2] + offset.
 """
@@ -48,7 +51,8 @@ def _supported(packed, state, dtype):
             and state.quant_type == "nf4" and dtype in (torch.float16, torch.float32)
             and state.code is not None and state.code.numel() == 16
             and state.code.dtype == torch.float32 and state.code.is_cuda
-            and state.absmax.is_cuda and len(state.shape) == 2
+            and state.absmax.is_cuda and len(state.shape) == 2 and packed.is_contiguous()
+            and state.blocksize in (32, 64, 128, 256, 512, 1024, 2048, 4096)
             and (state.shape[0] * state.shape[1]) % 2 == 0 and state.blocksize % 2 == 0
             and (not state.nested or (state.state2.blocksize > 0
                                       and state.state2.code.dtype == torch.float32
@@ -72,7 +76,7 @@ def dequantize_nf4(packed, state, dtype=None, out=None):
         offset = _offset_tensor(state.offset, packed.device) if nested else absmax2
         n_bytes = n // 2  # n is even: the [N, K] weights here have even K
         nf4_dequant_kernel[(triton.cdiv(n_bytes, BLOCK),)](
-            packed, state.absmax, state.code, code2, absmax2, offset, out, n_bytes,
+            packed, state.absmax, _nf4_code(packed.device), code2, absmax2, offset, out, n_bytes,
             BLOCKSIZE=state.blocksize, BLOCKSIZE2=s2.blocksize if nested else 1, NESTED=nested,
             BLOCK=BLOCK, num_warps=WARPS, enable_fp_fusion=False)
     return out
@@ -121,7 +125,8 @@ def patch_bnb_nf4_dequant():
                         quant_type="fp4"):
         if out is None and quant_state is not None and _supported(A, quant_state,
                                                                     quant_state.dtype):
-            return dequantize_nf4(A, quant_state)
+            out = dequantize_nf4(A, quant_state)
+            return out.t() if A.shape[0] == 1 else out  # bitsandbytes' [1, X] packed layout
         return original_dequant(A, quant_state, absmax, out, blocksize, quant_type)
 
     cuda_ops._dequant_linear_fallback = _dequant_linear_fallback

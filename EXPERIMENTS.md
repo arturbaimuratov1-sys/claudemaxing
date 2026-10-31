@@ -109,3 +109,18 @@ inputs (fp16) 6.3 KB; MLP input (fp32) 6.1 KB; dropout masks 2.3 KB.
   tensors seen on the RTX 4060 without a mask; the attention saving was mostly illusory.
 - `is_causal + enable_gqa` (no k/v expansion) is no alternative: torch falls back to a path that
   keeps 35 KB/token and is slower (bench_sdpa.py).
+
+### Run 2 of 5: ac0ce46 (no own attention; fp16 tied embedding, fp16 MLP input/output, RMSNorm keeps fp16 normalised value, 16 MB head chunks)
+
+| commit | soup train, s (base same run) | peak MiB (nvidia-smi) | torch alloc / reserved | eval loss vs base | own kernels (w/o SwiGLU) | checks |
+|---|---|---|---|---|---|---|
+| ac0ce46 | 74.1 (78.0), s = 1.053 | **3303** (572c891: 4263) | 3033 / 3160 | -0.002% | 7.1% (3.75%) | **10/10** |
+
+- check 6: first step 0.02%, mean of all steps 0.01%; check 8: time x0.949, memory x0.230.
+- own kernel ms (timed loop 45.27 s): silu_mul_bwd_recompute 964.5, lm_head_vocab_chunk 638.6,
+  silu_mul_fwd_persistent 563.0, qwen_rmsnorm_fwd 365.3, qwen_rope 349.1, qwen_rmsnorm_bwd 344.7.
+- Accepted as the new base of the branch (better memory, time not worse).
+- Real-model probe in the same session (memreal.py, 4 x 340 tokens): kept for backward per token
+  and layer: SDPA 13.0 KB (fp16, expanded k/v), LoRA A inputs 6.3 KB, RMSNorm 6.1 KB, MLP 3.1 KB,
+  dropout masks 3.0 KB; load-time peak 1990 MiB allocated while prepare_model_for_kbit_training
+  upcasts the embedding (a floor for the whole run).

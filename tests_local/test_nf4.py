@@ -87,3 +87,27 @@ def test_unsupported_falls_back():
     out = bnb.functional.dequantize_4bit(packed, state)  # fp4: the original path
     ref = nf4.ORIGINALS["dequant"](packed, state)
     assert torch.equal(out, ref)
+
+
+def test_no_fused_multiply_add_in_the_kernel():
+    """Bit-exactness needs the absmax step as a separate mul and add (no FMA contraction)."""
+    packed, state = quantized(256, 128, True)
+    nf4.dequantize_nf4(packed, state)
+    found = 0
+    for dev_cache in nf4.nf4_dequant_kernel.device_caches.values():
+        for compiled in dev_cache[0].values():
+            ptx = compiled.asm["ptx"]
+            assert "fma.rn.f32" not in ptx
+            found += 1
+    assert found
+
+
+def test_fp32_output_matches_bitsandbytes_fp32():
+    import bitsandbytes.functional as bnbF
+
+    torch.manual_seed(2)
+    w = torch.randn(512, 256, device="cuda") * 0.05
+    packed, state = bnbF.quantize_4bit(w, blocksize=64, quant_type="nf4", compress_statistics=True)
+    assert state.dtype == torch.float32
+    ref = nf4.ORIGINALS.get("dequant", bnbF.dequantize_4bit)(packed, state)
+    assert torch.equal(nf4.dequantize_nf4(packed, state), ref)

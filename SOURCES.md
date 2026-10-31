@@ -103,3 +103,20 @@ copied.
 - Our own observation from reading `peft.prepare_model_for_kbit_training` (peft 0.20.0,
   `peft/utils/other.py`), which upcasts the non-quantized parameters to fp32: the embedding is
   loaded in fp16, so its fp32 copy holds fp16 numbers only. No external code involved.
+
+## solution/nf4.py
+
+- **Reference behaviour**: bitsandbytes 0.50.2 `functional.dequantize_4bit` and
+  `backends/cuda/ops.py` (`_dequant_linear_fallback`, `_dequantize_4bit_impl`,
+  `_dequantize_blockwise_impl`): read for the packed layout (high nibble first), the NF4 table
+  (`get_4bit_type("nf4")`), the double-quantized absmax (`code2[q] * absmax2 + offset`, fp32) and
+  the order of roundings, so that our output is bit-identical. bitsandbytes also has a Triton
+  backend (`backends/triton/kernels_4bit.py`) with a 4-bit dequant kernel; it was not used as a
+  template and no code was taken from it. Our kernel fuses the nested absmax into the same pass.
+
+## solution/lora.py
+
+- **Reference behaviour**: peft 0.20.0 `tuners/lora/bnb.py` (`Linear4bit.forward`) and
+  `tuners/lora/layer.py` (`Linear.forward`): `base(x) + lora_B(lora_A(dropout(x))) * scaling`.
+  Packing a dropout mask into bits and rebuilding the dropped input in backward is our own
+  design; `torch.native_dropout` gives the same mask as `nn.Dropout` (tested).
