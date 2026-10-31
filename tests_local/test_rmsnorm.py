@@ -192,3 +192,29 @@ def test_patch_is_idempotent():
         assert cls.forward is first
     finally:
         cls.forward = saved
+
+
+def test_frozen_weight_fp32_input_keeps_fp16_copy():
+    """Activation compression: fp32 x with a frozen fp32 weight (the 4-bit model's norms) keeps an
+    fp16 copy of x for backward. Output bit-identical; dx within fp16 rounding of torch's."""
+    from solution.rmsnorm import rmsnorm
+
+    torch.manual_seed(0)
+    x = (torch.randn(4, 300, 1536, device="cuda") * 3).requires_grad_(True)
+    w = torch.rand(1536, device="cuda") + 0.5
+    g = torch.randn(4, 300, 1536, device="cuda")
+    saved = []
+    with torch.autograd.graph.saved_tensors_hooks(lambda t: saved.append(t) or t, lambda t: t):
+        out = rmsnorm(x, w, 1e-6)
+    out.backward(g)
+    dx = x.grad.clone()
+    assert torch.float16 in {t.dtype for t in saved}
+    assert not any(t.dtype == torch.float32 and t.numel() == x.numel() for t in saved)
+    x.grad = None
+    var = x.pow(2).mean(-1, keepdim=True)
+    ref = w * (x * torch.rsqrt(var + 1e-6))
+    ref.backward(g)
+    assert torch.equal(out, ref.detach()) or ((out - ref).abs().max() < 1e-5)
+    assert dx.dtype == torch.float32
+    rel = ((dx - x.grad).norm() / x.grad.norm()).item()
+    assert rel < 1e-3, rel
