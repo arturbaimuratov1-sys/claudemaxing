@@ -42,7 +42,7 @@ IGNORE_INDEX = -100
 # so the small probabilities of a 152K vocabulary do not flush to zero in fp16; backward
 # divides it out again together with the loss scale and the denominator.
 GRAD_SCALE = 1024.0
-CHUNK_BYTES = 64 * 2 ** 20  # one [rows, chunk] block of logits at most this big
+CHUNK_BYTES = 16 * 2 ** 20  # one [rows, chunk] block of logits at most this big (8192 cols min)
 _REQUEST_ATTR = "_fused_head_request"
 _STEP_ATTR = "_fused_head_step"
 try:  # the trainer attribute Soup's rewind recorder reads when a step has no logits
