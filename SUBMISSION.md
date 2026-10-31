@@ -1,9 +1,10 @@
 # Submission: claudemaxing
 
 ## Links
-- Repository, final commit: https://github.com/arturbaimuratov1-sys/claudemaxing/commit/<sha>
+- Repository, final commit: https://github.com/arturbaimuratov1-sys/claudemaxing/commit/947705c5abc2e8a6c1d181214d0674e9df0136be
+  (later commits only add these links to README.md and SUBMISSION.md; `solution/` is the same)
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
-  the README): <link>
+  the README): https://www.kaggle.com/code/togamyssovabilkaiyr/soup-kernel-challenge-claudemaxing
 - Demo video (up to 3 minutes): <link>
 - Presentation: <link>
 

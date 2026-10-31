@@ -43,7 +43,11 @@ Every kernel was tested against the torch reference in fp16 (values and gradient
 
 ## How to run
 
-1. Open the public Kaggle notebook (link in [SUBMISSION.md](SUBMISSION.md)), settings
+Kaggle notebook (template `templates/kaggle_notebook.ipynb`, `COMMIT` =
+`947705c5abc2e8a6c1d181214d0674e9df0136be`):
+https://www.kaggle.com/code/togamyssovabilkaiyr/soup-kernel-challenge-claudemaxing
+
+1. Open the public Kaggle notebook above, settings
    **GPU T4 x2**, **Internet on**, and **Run All**. It clones this repository at `COMMIT`,
    installs the pinned packages, trains base Soup and our solution, scores both adapters and runs
    the rule checks.
