@@ -29,14 +29,15 @@ Ideas taken from other work, with links (we wrote the code ourselves): see [SOUR
 tutorials read for patterns only; reference behaviour read in transformers, peft, TRL, Soup and
 bitsandbytes).
 
-## Results on Kaggle T4 (commit 3e1da26)
+## Results on Kaggle T4 (the notebook above, version 1, commit 947705c)
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 78.3 | 77.1 | speedup 1.016x |
-| Peak GPU memory, MiB | 14345 | 2839 | base/ours 5.05x |
-| Eval loss (public rows) | 2.04965 | 2.04965 | +0.000% |
+| Time of `soup train`, s | 80.4 | 77.9 | speedup 1.033x |
+| Peak GPU memory, MiB | 14345 | 2839 | base/ours 5.053x |
+| Eval loss (public rows) | 2.04969 | 2.04971 | +0.001% |
 
-- [x] All 10 checks of `harness/check_rules.py` passed
+- [x] All 10 checks of `harness/check_rules.py` passed (own kernels 14.4% of the training time;
+  loss curve: first step 0.02%, mean 0.01%; 79/79 Soup tests)
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits
 
 ## Limitations

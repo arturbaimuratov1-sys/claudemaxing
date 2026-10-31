@@ -5,14 +5,17 @@ on q/v, batch 4, up to 512 tokens, 64 steps) on a free Kaggle T4 through one fun
 `solution.apply()`. The training task, Soup's settings and Soup's outputs stay the same; the run
 needs **5x less GPU memory** than the base and is not slower.
 
-## Results (Kaggle T4, `harness/run_task.py` + `harness/check_rules.py`, commit 3e1da26)
+## Results (Kaggle T4, the submission notebook below, commit 947705c)
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 78.3 | 77.1 | speedup 1.016x |
-| Peak GPU memory (nvidia-smi), MiB | 14345 | 2839 | base/ours 5.05x |
-| Eval loss (public rows) | 2.04965 | 2.04965 | +0.000% |
-| Own kernels, share of training time | — | 15.0% (11.5% without the SwiGLU pair) | rule: >= 5% |
+| Time of `soup train`, s | 80.4 | 77.9 | speedup 1.033x |
+| Peak GPU memory (nvidia-smi), MiB | 14345 | 2839 | base/ours 5.053x |
+| Eval loss (public rows) | 2.04969 | 2.04971 | +0.001% |
+| Own kernels, share of training time | — | 14.4% | rule: >= 5% |
+
+An earlier measurement of the same code (3e1da26 in [EXPERIMENTS.md](EXPERIMENTS.md)): 77.1 s
+against 78.3 s, 2839 MiB, eval loss +0.000%, own kernels 15.0% (11.5% without the SwiGLU pair).
 
 All 10 checks of `check_rules.py` passed (first-step loss gap 0.02%, mean 0.01%; 79/79 Soup
 tests with our patches). Steady-state step 0.721 s against 0.857 s for the base (-16%); the wall
