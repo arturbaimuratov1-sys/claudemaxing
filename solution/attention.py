@@ -76,13 +76,18 @@ def qwen_attn_fwd_kernel(Q, K, V, KOK, O, LSE, sqb, sqh, sqt, skb, skh, skt, sob
 
 @triton.jit(do_not_specialize=["T"])  # T changes with every batch
 def qwen_attn_bwd_dkdv_kernel(Q, K, V, DO, KOK, LSE, DELTA, DK, DV, sqb, sqh, sqt, skb, skh,
-                              skt, sob, soh, sot, T, H, KVH, GROUP, qk_scale, sm_scale,
-                              HAS_MASK: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-                              D: tl.constexpr):
+                              skt, sob, soh, sot, sdb, sdh, sdt, T, H, KVH, GROUP, SPLIT,
+                              qk_scale, sm_scale, HAS_MASK: tl.constexpr, BM: tl.constexpr,
+                              BN: tl.constexpr, D: tl.constexpr):
+    # One program: BN keys of kv head kh and GROUP // SPLIT of its query heads. With SPLIT > 1
+    # DK/DV are fp32 partial sums [B, KVH * SPLIT, T, D], added up over the split afterwards.
     pid_n = tl.program_id(0)
-    bkh = tl.program_id(1)
-    b = bkh // KVH
-    kh = bkh % KVH
+    bks = tl.program_id(1)
+    b = bks // (KVH * SPLIT)
+    slot = bks % (KVH * SPLIT)
+    kh = slot // SPLIT
+    g_per = GROUP // SPLIT
+    g_lo = (slot % SPLIT) * g_per
     cols = pid_n * BN + tl.arange(0, BN)
     offs_m = tl.arange(0, BM)
     offs_d = tl.arange(0, D)
@@ -96,7 +101,7 @@ def qwen_attn_bwd_dkdv_kernel(Q, K, V, DO, KOK, LSE, DELTA, DK, DV, sqb, sqh, sq
     dk = tl.zeros([BN, D], tl.float32)
     dv = tl.zeros([BN, D], tl.float32)
     lo = (pid_n * BN // BM) * BM
-    for g in range(0, GROUP):
+    for g in range(g_lo, g_lo + g_per):
         h = kh * GROUP + g
         q_base = Q + b * sqb + h * sqh
         do_base = DO + b * sob + h * soh
@@ -115,8 +120,9 @@ def qwen_attn_bwd_dkdv_kernel(Q, K, V, DO, KOK, LSE, DELTA, DK, DV, sqb, sqh, sq
             dpt = tl.dot(v, tl.trans(do))
             dst = pt * (dpt - delta[None, :])
             dk += tl.dot(dst.to(tl.float16), q)
-    tl.store(DK + kv_off, (dk * sm_scale).to(DK.dtype.element_ty), mask=cols[:, None] < T)
-    tl.store(DV + kv_off, dv.to(DV.dtype.element_ty), mask=cols[:, None] < T)
+    out_off = b * sdb + slot * sdh + cols[:, None] * sdt + offs_d[None, :]
+    tl.store(DK + out_off, (dk * sm_scale).to(DK.dtype.element_ty), mask=cols[:, None] < T)
+    tl.store(DV + out_off, dv.to(DV.dtype.element_ty), mask=cols[:, None] < T)
 
 
 @triton.jit(do_not_specialize=["T"])  # T changes with every batch
@@ -162,6 +168,7 @@ def qwen_attn_bwd_dq_kernel(Q, K, V, DO, KOK, LSE, DELTA, DQ, sqb, sqh, sqt, skb
 # (BM, BN, warps) per kernel, sized for the T4 (64 KB of shared memory per block, fp16 tiles of
 # head_dim 128, one pipeline stage). If a GPU refuses a size, it is halved once and remembered.
 _BLOCKS = {"fwd": [64, 64, 4], "dkdv": [32, 64, 8], "dq": [64, 32, 8]}
+DKDV_SPLIT = 3  # dk/dv programs per kv head (query heads of a group split between them)
 
 
 def _launch(name, kernel, grid, args, **meta):
@@ -217,14 +224,23 @@ class QwenAttention(torch.autograd.Function):
         kok = key_ok if has_mask else lse
         q_dt, k_dt, v_dt = ctx.dtypes
         dq = torch.empty(q16.shape, dtype=q_dt, device=q16.device)
-        dk = torch.empty(k16.shape, dtype=k_dt, device=q16.device)
-        dv = torch.empty(k16.shape, dtype=v_dt, device=q16.device)
+        split = DKDV_SPLIT if (H // KVH) % DKDV_SPLIT == 0 else 1
+        if split == 1:
+            dk = torch.empty(k16.shape, dtype=k_dt, device=q16.device)
+            dv = torch.empty(k16.shape, dtype=v_dt, device=q16.device)
+        else:  # fp32 partial sums over parts of each group, added below
+            dk = torch.empty((B, KVH * split, T, D), dtype=torch.float32, device=q16.device)
+            dv = torch.empty_like(dk)
         qk_scale = ctx.scale * LOG2E
         _launch("dkdv", qwen_attn_bwd_dkdv_kernel,
-                lambda bm, bn: (triton.cdiv(T, bn), B * KVH),
+                lambda bm, bn: (triton.cdiv(T, bn), B * KVH * split),
                 (q16, k16, v16, do_view, kok, lse, delta, dk, dv, *_strides(q16),
-                 *_strides(k16), *_strides(do_view), T, H, KVH, H // KVH, qk_scale, ctx.scale),
+                 *_strides(k16), *_strides(do_view), *_strides(dk), T, H, KVH, H // KVH, split,
+                 qk_scale, ctx.scale),
                 HAS_MASK=has_mask, D=D)
+        if split > 1:
+            dk = dk.view(B, KVH, split, T, D).sum(2).to(k_dt)
+            dv = dv.view(B, KVH, split, T, D).sum(2).to(v_dt)
         _launch("dq", qwen_attn_bwd_dq_kernel, lambda bm, bn: (triton.cdiv(T, bm), B * H),
                 (q16, k16, v16, do_view, kok, lse, delta, dq, *_strides(q16), *_strides(k16),
                  *_strides(do_view), T, H, H // KVH, qk_scale, ctx.scale),
