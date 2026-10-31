@@ -110,7 +110,7 @@ def test_matches_peft():
         if not getattr(current[1], "_lora_branch", False):
             lora_bnb.Linear4bit.forward, lora_layer.Linear.forward = originals
     assert ours[0].dtype == ref[0].dtype
-    assert rel(ours[0], ref[0]) < 1e-3
+    assert torch.equal(ours[0], ref[0])  # forward bit-identical to peft
     assert rel(ours[1], ref[1]) < 2e-3
     assert ref[2].keys() == ours[2].keys() and len(ref[2]) == 4
     for n in ref[2]:
@@ -126,4 +126,23 @@ def test_same_mask_as_peft_dropout():
     a = torch.nn.functional.dropout(x, 0.05, True)
     torch.manual_seed(3)
     b, mask = torch.native_dropout(x, 0.05, True)
-    assert torch.equal(a, b) and torch.equal(a != 0, mask | (x == 0) & mask)
+    assert torch.equal(a, b)
+    assert torch.equal(torch.rand(5, device="cuda"), (torch.manual_seed(3), torch.native_dropout(
+        x, 0.05, True), torch.rand(5, device="cuda"))[2])  # same random stream afterwards
+
+
+def test_non_contiguous_input_falls_back():
+    from peft.tuners.lora import layer as lora_layer
+
+    L.patch_peft_lora_4bit()
+    model = model_pair()
+    x = torch.randn(50, 4, 256, device="cuda").transpose(0, 1)  # not contiguous
+    calls = []
+    real = L.LoRABranch.forward
+    L.LoRABranch.forward = staticmethod(lambda ctx, *a: (calls.append(1), real(ctx, *a))[1])
+    try:
+        with torch.autocast("cuda", dtype=torch.float16):
+            model(x.requires_grad_(True))
+    finally:
+        L.LoRABranch.forward = staticmethod(real)
+    assert not calls and getattr(lora_layer.Linear.forward, "_lora_branch", False)

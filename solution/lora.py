@@ -11,10 +11,11 @@ separately for the same x. Here:
 * one fp16 copy of x is shared by the q and v layers of a block (they get the same tensor);
 * lora_A's input is rebuilt in backward from that copy and the bits.
 
-Per token and layer that is 3.5 KB instead of 9.3 KB. One rounding differs from peft: lora_A's
-input is fp16(fp16(x) * scale) here, fp16(x * scale) there (at most 2^-11 relative, on the
-low-rank branch only). Everything else (fp16 matmuls of the adapter, the scaling, the fp32 sum
-with the base output, the gradient casts of autocast) follows peft's computation.
+Per token and layer that is 3.5 KB instead of 9.3 KB. The forward is peft's bit for bit (lora_A's
+input fp16(x * scale) is computed from the fp32 x). Only lora_A's weight gradient differs: it
+uses the input rebuilt from the fp16 copy, fp16(fp16(x) * scale), at most 2^-11 relative away.
+Everything else (fp16 matmuls of the adapter, the scaling, the fp32 sum with the base output,
+the gradient casts of autocast) follows peft's computation.
 """
 
 import weakref
@@ -56,12 +57,12 @@ def lora_dropout_unpack_kernel(x_ptr, bits_ptr, g_ptr, xd_ptr, dx_ptr, n_bytes, 
     tl.store(dx_ptr + offs, tl.where(keep, g * scale, 0.0).to(dx_ptr.dtype.element_ty), mask=ok)
 
 
-def _pack(x16, mask, scale):
-    n = x16.numel()
-    xd = torch.empty_like(x16)
-    bits = torch.empty(n // 8, dtype=torch.uint8, device=x16.device)
+def _pack(x, mask, scale):
+    n = x.numel()
+    xd = torch.empty(x.shape, dtype=torch.float16, device=x.device)
+    bits = torch.empty(n // 8, dtype=torch.uint8, device=x.device)
     lora_dropout_pack_kernel[(triton.cdiv(n // 8, PACK_BYTES),)](
-        x16, mask, xd, bits, n // 8, scale, BLOCK=PACK_BYTES, num_warps=4)
+        x, mask, xd, bits, n // 8, scale, BLOCK=PACK_BYTES, num_warps=4)
     return xd, bits
 
 
@@ -79,9 +80,10 @@ class LoRABranch(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, x16, weight_a, weight_b, p, scaling):
-        _, mask = torch.native_dropout(x, p, True)
+        dropped, mask = torch.native_dropout(x, p, True)
+        del dropped  # only the mask is used; free the fp32 copy now
         scale = 1.0 / (1.0 - p)
-        xd, bits = _pack(x16, mask, scale)
+        xd, bits = _pack(x, mask, scale)  # from fp32 x: lora_A's input exactly as peft's
         del mask
         a16, b16 = weight_a.to(torch.float16), weight_b.to(torch.float16)
         a = torch.nn.functional.linear(xd, a16)
@@ -105,15 +107,18 @@ class LoRABranch(torch.autograd.Function):
         return (dx, None, grad_a.to(weight_a.dtype), grad_b.to(weight_b.dtype), None, None)
 
 
-_X16 = [None, -1, None]  # (weakref to x, its version, fp16 copy)
+_X16 = [None, None, None]  # (weakref to x, (version, data_ptr, shape), weakref to fp16 copy)
 
 
 def _shared_fp16(x):
-    ref, version, x16 = _X16
-    if ref is not None and ref() is x and version == x._version:
+    ref, key, x16_ref = _X16
+    now = (x._version, x.data_ptr(), tuple(x.shape))
+    x16 = x16_ref() if x16_ref is not None else None
+    if x16 is not None and ref is not None and ref() is x and key == now:
         return x16
     x16 = x.detach().to(torch.float16).contiguous()
-    _X16[0], _X16[1], _X16[2] = weakref.ref(x), x._version, x16
+    # weak references only: the saved tensors of LoRABranch keep x16 alive as long as needed
+    _X16[0], _X16[1], _X16[2] = weakref.ref(x), now, weakref.ref(x16)
     return x16
 
 
@@ -133,11 +138,13 @@ def _make_forward(original):
                 or name not in self.lora_A or name in getattr(self, "lora_variant", {})
                 or not self.training or not torch.is_grad_enabled() or not _autocast_fp16()
                 or not isinstance(x, torch.Tensor) or not x.is_cuda
-                or x.dtype != torch.float32 or x.shape[-1] % 8
+                or x.dtype != torch.float32 or x.shape[-1] % 8 or not x.is_contiguous()
                 or type(drop) is not torch.nn.Dropout or not 0.0 < drop.p < 1.0
                 or type(self.lora_A[name]) is not torch.nn.Linear
                 or type(self.lora_B[name]) is not torch.nn.Linear
                 or self.lora_A[name].bias is not None or self.lora_B[name].bias is not None
+                or self.lora_A[name].weight.dtype != torch.float32
+                or self.lora_B[name].weight.dtype != torch.float32
                 or getattr(self, "use_dora", {}).get(name, False)
                 or getattr(self, "fan_in_fan_out", False)):
             return original(self, x, *args, **kwargs)
