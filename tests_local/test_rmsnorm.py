@@ -195,12 +195,15 @@ def test_patch_is_idempotent():
 
 
 def test_frozen_weight_fp32_input_keeps_fp16_copy():
-    """Activation compression: fp32 x with a frozen fp32 weight (the 4-bit model's norms) keeps an
-    fp16 copy of x for backward. Output bit-identical; dx within fp16 rounding of torch's."""
+    """Activation compression: fp32 x with a frozen fp32 weight (the 4-bit model's norms) keeps the
+    fp16 normalised value for backward. Output equal to torch's to fp32 rounding; dx within fp16
+    rounding of torch's, also with residual values far outside the fp16 range."""
     from solution.rmsnorm import rmsnorm
 
     torch.manual_seed(0)
-    x = (torch.randn(4, 300, 1536, device="cuda") * 3).requires_grad_(True)
+    x = torch.randn(4, 300, 1536, device="cuda") * 3
+    x[:, :, 7] = 2e5  # a "massive activation" channel: beyond fp16's 65504
+    x.requires_grad_(True)
     w = torch.rand(1536, device="cuda") + 0.5
     g = torch.randn(4, 300, 1536, device="cuda")
     saved = []
@@ -214,7 +217,8 @@ def test_frozen_weight_fp32_input_keeps_fp16_copy():
     var = x.pow(2).mean(-1, keepdim=True)
     ref = w * (x * torch.rsqrt(var + 1e-6))
     ref.backward(g)
-    assert torch.equal(out, ref.detach()) or ((out - ref).abs().max() < 1e-5)
+    assert ((out - ref).abs().max() < 1e-5)
+    assert torch.isfinite(dx).all()
     assert dx.dtype == torch.float32
     rel = ((dx - x.grad).norm() / x.grad.norm()).item()
     assert rel < 1e-3, rel

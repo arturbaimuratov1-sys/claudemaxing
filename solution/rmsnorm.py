@@ -37,15 +37,17 @@ def qwen_rmsnorm_fwd_kernel(x_ptr, w_ptr, out_ptr, rstd_ptr, low_ptr, n_cols, ep
     normed = (x * rstd).to(x_ptr.dtype.element_ty).to(tl.float32)
     tl.store(rstd_ptr + row, rstd)
     tl.store(out_ptr + offs, (normed * w).to(out_ptr.dtype.element_ty), mask=mask)
-    if SAVE_LOW:  # fp16 copy of x for backward (see RMSNorm.forward)
-        tl.store(low_ptr + offs, x.to(low_ptr.dtype.element_ty), mask=mask)
+    if SAVE_LOW:  # fp16 normalised value for backward (see RMSNorm.forward)
+        tl.store(low_ptr + offs, (x * rstd).to(low_ptr.dtype.element_ty), mask=mask)
 
 
 # n_rows changes with every batch; not specialising on it keeps one compiled variant.
 @triton.jit(do_not_specialize=["n_rows"])
 def qwen_rmsnorm_bwd_kernel(dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, dw_part_ptr, n_rows, n_cols,
                             BLOCK: tl.constexpr, COMPUTE_DW: tl.constexpr,
-                            ROUND_TO_X: tl.constexpr):
+                            SAVED_NORMED: tl.constexpr):
+    # SAVED_NORMED: x_ptr holds the fp16 normalised value x * rstd of an fp32 x (frozen weight,
+    # so COMPUTE_DW is False); the fp32 reference does no rounding. Otherwise x_ptr holds x.
     pid = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
@@ -58,13 +60,16 @@ def qwen_rmsnorm_bwd_kernel(dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, dw_part_ptr,
         x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         dy = tl.load(dy_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         rstd = tl.load(rstd_ptr + row)
-        normed = x * rstd
+        if SAVED_NORMED:
+            normed = x
+        else:
+            normed = x * rstd
         if COMPUTE_DW:
             dw_acc += dy * normed.to(x_ptr.dtype.element_ty).to(tl.float32)
         # The reference multiplies the rounded value by w, so its gradient is rounded to the
         # input dtype too before it flows back through the cast.
         grad_normed = dy * w
-        if ROUND_TO_X:  # the reference rounds to the dtype of x (a no-op for fp32 x)
+        if not SAVED_NORMED:  # the reference rounds to the dtype of x (a no-op for fp32 x)
             grad_normed = grad_normed.to(x_ptr.dtype.element_ty).to(tl.float32)
         mean_dot = tl.sum(grad_normed * normed, axis=0) / n_cols
         dx = (grad_normed - normed * mean_dot) * rstd
@@ -95,8 +100,10 @@ class RMSNorm(torch.autograd.Function):
                           device=x.device)
         rstd = torch.empty(n_rows, dtype=torch.float32, device=x.device)
         # Activation compression: with an fp32 x and a frozen weight, backward needs x only
-        # for the normalised value inside dx, so an fp16 copy is kept (rstd stays exact fp32);
-        # dx changes by ~5e-4 relative. A trainable weight keeps the exact fp32 x.
+        # for the normalised value x * rstd inside dx, so that value is kept in fp16 (it is at
+        # most sqrt(n_cols) in size, so it cannot overflow fp16 the way a large residual could);
+        # dx changes by ~1e-5 relative (2^-11 per element at most). A trainable weight keeps
+        # the exact fp32 x.
         low = (torch.empty((n_rows, n_cols), dtype=torch.float16, device=x.device)
                if x.dtype == torch.float32 and not weight.requires_grad
                and ctx.needs_input_grad[0] else None)
@@ -126,7 +133,7 @@ class RMSNorm(torch.autograd.Function):
                        if need_dw else rstd)
             qwen_rmsnorm_bwd_kernel[(programs,)](grad2, x2, weight, rstd, dx, partial, n_rows,
                                                  n_cols, BLOCK=block, COMPUTE_DW=need_dw,
-                                                 ROUND_TO_X=x2.dtype == ctx.x_dtype,
+                                                 SAVED_NORMED=x2.dtype != ctx.x_dtype,
                                                  num_warps=warps)
             if need_dw:
                 dw = partial.sum(0).to(weight.dtype)
