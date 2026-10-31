@@ -38,26 +38,36 @@ def test_lossless_and_same_outputs():
     out_ref = emb(ids)
     calls = []
     emb.register_forward_hook(lambda m, i, o: calls.append(o.dtype))  # peft-style hook still runs
-    assert shrink_tied_embedding(model) is True
+    assert shrink_tied_embedding(model) is False  # outside fp16 autocast: not yet
+    with torch.autocast("cuda", dtype=torch.float16):
+        assert shrink_tied_embedding(model) is True
     assert emb.weight.dtype == torch.float16 and head.weight is emb.weight
     assert torch.equal(emb.weight.float(), ref)
     out = emb(ids)
     assert out.dtype == torch.float32 and torch.equal(out, out_ref)
     assert calls == [torch.float32]
     assert shrink_tied_embedding(model) is True  # idempotent
+    with torch.autocast("cuda", dtype=torch.float16):
+        assert torch.equal(emb(ids), out_ref)
+    import copy
+
+    assert torch.equal(copy.deepcopy(emb)(ids), out_ref)
 
 
 def test_not_exact_left_alone():
     model = tiny()
     w = model.get_input_embeddings().weight
     w.data[0, 0] = 1.0 + 2 ** -20  # not an fp16 number
-    assert shrink_tied_embedding(model) is False
+    with torch.autocast("cuda", dtype=torch.float16):
+        assert shrink_tied_embedding(model) is False
+    assert w.data[0, 0].item() == 1.0 + 2 ** -20
     assert w.dtype == torch.float32
 
 
 def test_untied_or_trainable_left_alone():
-    model = tiny(tied=False)
-    assert shrink_tied_embedding(model) is False
-    model = tiny()
-    model.get_input_embeddings().weight.requires_grad_(True)
-    assert shrink_tied_embedding(model) is False
+    with torch.autocast("cuda", dtype=torch.float16):
+        model = tiny(tied=False)
+        assert shrink_tied_embedding(model) is False
+        model = tiny()
+        model.get_input_embeddings().weight.requires_grad_(True)
+        assert shrink_tied_embedding(model) is False

@@ -11,7 +11,10 @@ it in fp16 halves that and changes no value:
 
 It is done only when every value is exactly representable in fp16 (checked chunk by chunk), the
 weight is frozen and tied, and the module is a plain nn.Embedding; otherwise nothing changes.
+The conversion goes through pinned host memory, so the GPU never holds both copies.
 """
+
+import types
 
 import torch
 import torch.nn.functional as F
@@ -19,35 +22,57 @@ import torch.nn.functional as F
 _DONE = "_fp16_tied_embedding"
 
 
-def _exact_in_fp16(weight, rows=8192):
+def _fp16_embedding_forward(self, input):
+    """nn.Embedding.forward on the fp16 weight, returning the fp32 values the base returns."""
+    return F.embedding(input, self.weight, self.padding_idx, self.max_norm, self.norm_type,
+                       self.scale_grad_by_freq, self.sparse).to(torch.float32)
+
+
+def _to_fp16_via_host(weight, rows=8192):
+    """fp16 copy of the fp32 `weight` that never has both copies on the GPU: each chunk is
+    checked (exactly an fp16 number?) and staged in pinned host memory, the fp32 storage is
+    released, then the fp16 tensor is uploaded. None (weight untouched) if a value is not exact."""
+    host = torch.empty(weight.shape, dtype=torch.float16, pin_memory=True)
     for r0 in range(0, weight.shape[0], rows):
-        chunk = weight[r0:r0 + rows]
-        if not torch.equal(chunk.half().float(), chunk):
-            return False
+        chunk = weight.data[r0:r0 + rows]
+        low = chunk.half()
+        if not torch.equal(low.float(), chunk):
+            return None
+        host[r0:r0 + rows].copy_(low)
+    device = weight.device
+    weight.data = torch.empty(0, dtype=torch.float16, device=device)  # frees the fp32 storage
+    weight.data = host.to(device)
     return True
+
+
+def _autocast_fp16():
+    try:
+        return torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.float16
+    except (TypeError, AttributeError):  # torch < 2.4
+        return torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
 
 
 def shrink_tied_embedding(lm):
     """Store the tied fp32 embedding/head weight of `lm` (a *ForCausalLM) in fp16 if lossless.
-    Returns True when the weight is (now) stored in fp16 by this function."""
+    Called from the fused training step, which runs under fp16 autocast (the head is then only
+    used through fp16 matmuls). Returns True when the weight is (now) stored in fp16 by us."""
     if getattr(lm, _DONE, None) is not None:
         return getattr(lm, _DONE)
+    if not _autocast_fp16():
+        return False  # decide on a later call, under the training autocast
     ok = False
     emb, head = lm.get_input_embeddings(), lm.get_output_embeddings()
     w = getattr(emb, "weight", None)
     if (type(emb) is torch.nn.Embedding and type(head) is torch.nn.Linear and w is not None
             and head.weight is w and w.dtype == torch.float32 and w.is_cuda
             and not w.requires_grad and emb.max_norm is None and not emb.sparse
-            and not emb._forward_pre_hooks and _exact_in_fp16(w.detach())):
+            and not emb._forward_pre_hooks and "forward" not in emb.__dict__
+            and not hasattr(emb, "_hf_hook")):
         with torch.no_grad():
-            w.data = w.data.half()  # one Parameter, shared by the embedding and the head
-
-        def forward(input, _emb=emb):
-            return F.embedding(input, _emb.weight, _emb.padding_idx, _emb.max_norm,
-                               _emb.norm_type, _emb.scale_grad_by_freq,
-                               _emb.sparse).to(torch.float32)
-
-        emb.forward = forward  # instance attribute: module hooks (peft's) still run around it
-        ok = True
+            ok = _to_fp16_via_host(w) is not None  # one Parameter, shared with the head
+        if ok:
+            # bound method on the instance: module hooks (peft's) still run around it, and it
+            # follows the module through deepcopy
+            emb.forward = types.MethodType(_fp16_embedding_forward, emb)
     setattr(lm, _DONE, ok)
     return ok
