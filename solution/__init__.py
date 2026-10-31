@@ -13,6 +13,7 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+from .lm_head_loss import patch_fused_head_loss
 from .rmsnorm import patch_qwen2_rmsnorm
 from .swiglu_recompute import patch_qwen2_mlp_recompute
 
@@ -20,3 +21,4 @@ from .swiglu_recompute import patch_qwen2_mlp_recompute
 def apply():
     patch_qwen2_mlp_recompute()  # SwiGLU with recomputation (solution/swiglu_recompute.py)
     patch_qwen2_rmsnorm()  # our fused RMSNorm (solution/rmsnorm.py)
+    patch_fused_head_loss()  # head + loss + metrics without full logits (solution/lm_head_loss.py)
