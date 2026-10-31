@@ -13,6 +13,7 @@ weight that prepare_model_for_kbit_training leaves in a 4-bit model). All sums a
 """
 
 import functools
+import weakref
 
 import torch
 import triton
@@ -37,17 +38,18 @@ def qwen_rmsnorm_fwd_kernel(x_ptr, w_ptr, out_ptr, rstd_ptr, low_ptr, n_cols, ep
     normed = (x * rstd).to(x_ptr.dtype.element_ty).to(tl.float32)
     tl.store(rstd_ptr + row, rstd)
     tl.store(out_ptr + offs, (normed * w).to(out_ptr.dtype.element_ty), mask=mask)
-    if SAVE_LOW:  # fp16 normalised value for backward (see RMSNorm.forward)
-        tl.store(low_ptr + offs, (x * rstd).to(low_ptr.dtype.element_ty), mask=mask)
+    if SAVE_LOW:  # fp16 copy of the output, kept for backward (see RMSNorm.forward)
+        tl.store(low_ptr + offs, (normed * w).to(low_ptr.dtype.element_ty), mask=mask)
 
 
 # n_rows changes with every batch; not specialising on it keeps one compiled variant.
 @triton.jit(do_not_specialize=["n_rows"])
 def qwen_rmsnorm_bwd_kernel(dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, dw_part_ptr, n_rows, n_cols,
                             BLOCK: tl.constexpr, COMPUTE_DW: tl.constexpr,
-                            SAVED_NORMED: tl.constexpr):
-    # SAVED_NORMED: x_ptr holds the fp16 normalised value x * rstd of an fp32 x (frozen weight,
-    # so COMPUTE_DW is False); the fp32 reference does no rounding. Otherwise x_ptr holds x.
+                            SAVED_OUTPUT: tl.constexpr):
+    # SAVED_OUTPUT: x_ptr holds the fp16 copy of the output (x * rstd) * w of an fp32 x (frozen
+    # weight without zeros, so COMPUTE_DW is False); the normalised value is that divided by w,
+    # and the fp32 reference does no rounding. Otherwise x_ptr holds x.
     pid = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
@@ -60,8 +62,8 @@ def qwen_rmsnorm_bwd_kernel(dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, dw_part_ptr,
         x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         dy = tl.load(dy_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         rstd = tl.load(rstd_ptr + row)
-        if SAVED_NORMED:
-            normed = x
+        if SAVED_OUTPUT:
+            normed = tl.where(mask, x / w, 0.0)  # masked lanes: w = 0 there
         else:
             normed = x * rstd
         if COMPUTE_DW:
@@ -69,7 +71,7 @@ def qwen_rmsnorm_bwd_kernel(dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, dw_part_ptr,
         # The reference multiplies the rounded value by w, so its gradient is rounded to the
         # input dtype too before it flows back through the cast.
         grad_normed = dy * w
-        if not SAVED_NORMED:  # the reference rounds to the dtype of x (a no-op for fp32 x)
+        if not SAVED_OUTPUT:  # the reference rounds to the dtype of x (a no-op for fp32 x)
             grad_normed = grad_normed.to(x_ptr.dtype.element_ty).to(tl.float32)
         mean_dot = tl.sum(grad_normed * normed, axis=0) / n_cols
         dx = (grad_normed - normed * mean_dot) * rstd
@@ -88,6 +90,30 @@ def _launch_shape(n_cols):
     return block, min(max(block // 256, 1), 16)
 
 
+_LAST_LOW = [None, -1, None]  # (weakref to the last output, its version, weakref to its fp16 copy)
+_NO_ZEROS = {}
+
+
+def _no_zeros(weight):
+    """True if the frozen weight has no zero (checked once per weight version)."""
+    key = id(weight)
+    entry = _NO_ZEROS.get(key)
+    if entry is None or entry[0]() is not weight or entry[1] != weight._version:
+        entry = (weakref.ref(weight), weight._version, not bool((weight == 0).any()))
+        _NO_ZEROS[key] = entry
+    return entry[2]
+
+
+def fp16_copy_of(t):
+    """The fp16 copy of `t` if `t` is the last output of the fused RMSNorm (bit-identical to
+    t.to(torch.float16)), else None."""
+    ref, version, low_ref = _LAST_LOW
+    if ref is None or ref() is not t or t._version != version:
+        return None
+    low = low_ref()
+    return None if low is None else low.view(t.shape)
+
+
 class RMSNorm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps):
@@ -100,13 +126,16 @@ class RMSNorm(torch.autograd.Function):
                           device=x.device)
         rstd = torch.empty(n_rows, dtype=torch.float32, device=x.device)
         # Activation compression: with an fp32 x and a frozen weight, backward needs x only
-        # for the normalised value x * rstd inside dx, so that value is kept in fp16 (it is at
-        # most sqrt(n_cols) in size, so it cannot overflow fp16 the way a large residual could);
-        # dx changes by ~1e-5 relative (2^-11 per element at most). A trainable weight keeps
-        # the exact fp32 x.
+        # for the normalised value x * rstd inside dx. The kernel writes the fp16 copy of the
+        # output, (x * rstd) * w, and backward divides it by w (a weight without zeros):
+        # 2^-11 relative per element, dx changes by ~1e-5 relative. That fp16 copy is exactly
+        # what the next layers cast the output to (q/k/v and the MLP compute in fp16), so they
+        # take it from here (fp16_copy_of) and keep the same tensor: one copy for all of them.
+        # A trainable weight, or one with zeros, keeps the exact fp32 x.
         low = (torch.empty((n_rows, n_cols), dtype=torch.float16, device=x.device)
-               if x.dtype == torch.float32 and not weight.requires_grad
-               and ctx.needs_input_grad[0] else None)
+               if x.dtype == torch.float32 and weight.dtype == torch.float32
+               and not weight.requires_grad and ctx.needs_input_grad[0]
+               and _no_zeros(weight) else None)
         if n_rows:
             block, warps = _launch_shape(n_cols)
             qwen_rmsnorm_fwd_kernel[(n_rows,)](x2, weight, out, rstd,
@@ -116,7 +145,11 @@ class RMSNorm(torch.autograd.Function):
         ctx.save_for_backward(low if low is not None else x2, weight, rstd)
         ctx.x_dtype = x.dtype
         ctx.shape = shape
-        return out.view(shape)
+        result = out.view(shape)
+        if low is not None:
+            _LAST_LOW[0], _LAST_LOW[1], _LAST_LOW[2] = (weakref.ref(result), result._version,
+                                                         weakref.ref(low))
+        return result
 
     @staticmethod
     def backward(ctx, grad):
@@ -133,7 +166,7 @@ class RMSNorm(torch.autograd.Function):
                        if need_dw else rstd)
             qwen_rmsnorm_bwd_kernel[(programs,)](grad2, x2, weight, rstd, dx, partial, n_rows,
                                                  n_cols, BLOCK=block, COMPUTE_DW=need_dw,
-                                                 SAVED_NORMED=x2.dtype != ctx.x_dtype,
+                                                 SAVED_OUTPUT=x2.dtype != ctx.x_dtype,
                                                  num_warps=warps)
             if need_dw:
                 dw = partial.sum(0).to(weight.dtype)

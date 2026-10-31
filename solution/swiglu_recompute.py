@@ -23,6 +23,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .rmsnorm import fp16_copy_of
+
 BLOCK = 1024
 WARPS = 4
 _SUPPORTED = (torch.float16, torch.bfloat16, torch.float32)
@@ -157,7 +159,9 @@ class MLPInputRecompute(torch.autograd.Function):
             import bitsandbytes as bnb
 
             (wg, qg), (wu, qu), compute = nf4
-            x_low = x.to(compute)
+            x_low = fp16_copy_of(x) if compute == torch.float16 else None
+            if x_low is None:  # the norm before the MLP usually wrote this exact copy already
+                x_low = x.to(compute)
             gate = bnb.matmul_4bit(x_low, wg, quant_state=qg)
             up = bnb.matmul_4bit(x_low, wu, quant_state=qu)
             out_dtype, round_silu = x.dtype, x.dtype == compute

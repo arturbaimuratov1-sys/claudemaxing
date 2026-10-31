@@ -116,7 +116,11 @@ def _shared_fp16(x):
     x16 = x16_ref() if x16_ref is not None else None
     if x16 is not None and ref is not None and ref() is x and key == now:
         return x16
-    x16 = x.detach().to(torch.float16).contiguous()
+    from .rmsnorm import fp16_copy_of
+
+    x16 = fp16_copy_of(x)  # the norm before q/v already wrote this exact copy
+    if x16 is None:
+        x16 = x.detach().to(torch.float16).contiguous()
     # weak references only: the saved tensors of LoRABranch keep x16 alive as long as needed
     _X16[0], _X16[1], _X16[2] = weakref.ref(x), now, weakref.ref(x16)
     return x16
